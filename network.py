@@ -1,0 +1,186 @@
+"""Asynchronous HTTP helpers using QGIS' shared network stack."""
+
+import json
+from urllib.parse import quote, urlencode
+from xml.etree import ElementTree
+
+from qgis.PyQt.QtCore import QUrl, QUrlQuery
+from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
+from qgis.core import QgsNetworkAccessManager
+
+
+AUQ_REST = "https://gis.egt.ee/arcgis/rest/services/AUQ_public/AUQ_webapp_open/MapServer"
+EGT_WFS = "https://maps.egt.ee/geoserver/faktika/ows"
+GEA_API = "https://gea-api.egt.ee"
+SARV_API = "https://rwapi.geoloogia.info/api/v1/public"
+
+
+def _local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_capabilities(payload, protocol):
+    """Return ``(name, title)`` tuples from a WMS or WFS capabilities document."""
+    root = ElementTree.fromstring(payload)
+    result = []
+    wanted_parent = "Layer" if protocol.upper() == "WMS" else "FeatureType"
+    for element in root.iter():
+        if _local_name(element.tag) != wanted_parent:
+            continue
+        name = ""
+        title = ""
+        for child in list(element):
+            tag = _local_name(child.tag)
+            if tag == "Name" and child.text:
+                name = child.text.strip()
+            elif tag == "Title" and child.text:
+                title = child.text.strip()
+        if name:
+            result.append((name, title or name))
+    return result
+
+
+class NetworkClient:
+    """Keep replies alive and decode XML/JSON without blocking the UI thread."""
+
+    def __init__(self):
+        self._replies = set()
+        self._manager = QgsNetworkAccessManager.instance()
+
+    def get_capabilities(self, protocol, service_url, success, failure):
+        url = QUrl(service_url)
+        query = QUrlQuery(url)
+        query.addQueryItem("service", protocol.upper())
+        query.addQueryItem("request", "GetCapabilities")
+        query.addQueryItem("version", "1.3.0" if protocol.upper() == "WMS" else "2.0.0")
+        url.setQuery(query)
+        self._get(
+            url,
+            lambda data: success(parse_capabilities(data, protocol)),
+            failure,
+        )
+
+    def get_json(self, url, success, failure):
+        target = url if isinstance(url, QUrl) else QUrl(url)
+        self._get(target, lambda data: success(json.loads(bytes(data).decode("utf-8"))), failure)
+
+    def query_auq(self, table_id, where, success, failure, order_by=""):
+        url = QUrl(f"{AUQ_REST}/{table_id}/query")
+        query = QUrlQuery()
+        query.addQueryItem("f", "json")
+        query.addQueryItem("where", where)
+        query.addQueryItem("outFields", "*")
+        query.addQueryItem("returnGeometry", "false")
+        query.addQueryItem("resultRecordCount", "2000")
+        if order_by:
+            query.addQueryItem("orderByFields", order_by)
+        url.setQuery(query)
+        self.get_json(url, success, failure)
+
+    def query_auq_parent_ids(self, table_id, success, failure):
+        """Return object UUIDs which have rows in an AUQ related table."""
+        statistics = json.dumps(
+            [{
+                "statisticType": "count",
+                "onStatisticField": "objectid",
+                "outStatisticFieldName": "row_count",
+            }],
+            separators=(",", ":"),
+        )
+        parameters = {
+            "f": "json",
+            "where": "puurauk_vaatluspunkt_id IS NOT NULL",
+            "outStatistics": statistics,
+            "groupByFieldsForStatistics": "puurauk_vaatluspunkt_id",
+            "orderByFields": "puurauk_vaatluspunkt_id",
+            "returnGeometry": "false",
+            "resultRecordCount": "2000",
+        }
+        encoded = f"{AUQ_REST}/{table_id}/query?{urlencode(parameters)}".encode("utf-8")
+        url = QUrl.fromEncoded(encoded)
+
+        def decoded(payload):
+            if payload.get("error"):
+                failure(payload["error"].get("message", "AUQ query failed"))
+                return
+            values = {
+                str(feature.get("attributes", {}).get("puurauk_vaatluspunkt_id") or "").upper()
+                for feature in payload.get("features", [])
+            }
+            success({value for value in values if value})
+
+        self.get_json(url, decoded, failure)
+
+    def query_sarv(self, resource, parameters, success, failure):
+        """Query a public SARV API resource and return its decoded JSON payload."""
+        path = str(resource).strip("/")
+        url = QUrl(f"{SARV_API}/{path}/")
+        query = QUrlQuery()
+        for key, value in parameters.items():
+            if value not in (None, "", []):
+                query.addQueryItem(key, str(value))
+        url.setQuery(query)
+        self.get_json(url, success, failure)
+
+    def query_geological_units(self, role, global_id, success, failure):
+        """Load the selected object's depth intervals from EGT WFS as GeoJSON."""
+        type_name = (
+            "faktika:puurauk_geoloogiline_yksus"
+            if role == "boreholes"
+            else "faktika:vaatluspunkt_geoloogiline_yksus"
+        )
+        safe_id = str(global_id).replace("'", "''")
+        url = QUrl(EGT_WFS)
+        query = QUrlQuery()
+        for key, value in (
+            ("service", "WFS"),
+            ("version", "2.0.0"),
+            ("request", "GetFeature"),
+            ("typeNames", type_name),
+            ("outputFormat", "application/json"),
+            ("count", "2000"),
+            ("sortBy", "z_suht_ylemine"),
+            ("CQL_FILTER", f"puurauk_vaatluspunkt_id='{safe_id}'"),
+        ):
+            query.addQueryItem(key, value)
+        url.setQuery(query)
+
+        def decoded(payload):
+            features = payload.get("features", [])
+            success([feature.get("properties", {}) for feature in features])
+
+        self.get_json(url, decoded, failure)
+
+    def query_borehole_profile(self, global_id, success, failure):
+        """Load a borehole and its nested geology from EGT's public GEA API."""
+        encoded_id = quote(str(global_id), safe="")
+        url = f"{GEA_API}/puurauk/{encoded_id}"
+
+        def decoded(payload):
+            units = payload.get("geoloogiline_yksus_collection", [])
+            success(units if isinstance(units, list) else [])
+
+        self.get_json(url, decoded, failure)
+
+    def _get(self, url, success, failure):
+        request = QNetworkRequest(url)
+        request.setHeader(
+            QNetworkRequest.KnownHeaders.UserAgentHeader,
+            "QGIS Qeoloog/3.4.3",
+        )
+        reply = self._manager.get(request)
+        self._replies.add(reply)
+
+        def finished():
+            self._replies.discard(reply)
+            try:
+                if reply.error() != QNetworkReply.NetworkError.NoError:
+                    failure(reply.errorString())
+                else:
+                    success(reply.readAll())
+            except (ValueError, ElementTree.ParseError, json.JSONDecodeError) as error:
+                failure(str(error))
+            finally:
+                reply.deleteLater()
+
+        reply.finished.connect(finished)

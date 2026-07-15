@@ -1,0 +1,21 @@
+[general]
+name=Qeoloog
+description=EGT GEA ja SARV geoloogiaandmete kuvamise ja uurimise rakendus koos MaRu WMS/WFS teenuste toega.
+about=Qeoloog kuvab ja seob eelkõige EGT GEA ning SARV andmebaaside geoloogiaandmeid: puuraukude ja vaatluspunktide üldandmeid, läbilõikeid, puursüdamikke ja nende pilte, proove, analüüse, eksemplare, manuseid ning kirjandust. Lisaks saab avada ja seadistada Maa- ja Ruumiameti (MaRu) ning teiste avalike andmeallikate WMS/WFS teenuseid.
+version=3.4.3
+qgisMinimumVersion=4.0
+qgisMaximumVersion=4.99
+author=Tavoani
+email=tavo.ani@icloud.com
+category=Web
+tags=Estonia,EGT,GEA,SARV,MaRu,WMS,WFS,Maa- ja Ruumiamet,geology,borehole,core,basemap
+experimental=False
+deprecated=False
+server=False
+hasProcessingProvider=False
+changelog=3.4.3 - Added repository-ready licensing, PNG icon and bilingual documentation.
+    3.4.2 - Fixed SARV drill-core image links.
+tracker=https://github.com/tavoani/Qeoloog/issues
+repository=https://github.com/tavoani/Qeoloog
+homepage=https://github.com/tavoani/Qeoloog
+icon=icons/qeoloog.png
