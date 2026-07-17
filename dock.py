@@ -1413,9 +1413,12 @@ class DetailWidget(QWidget):
         self._overview_has_sarv_id = bool(str(attributes.get("sarv_id") or "").strip())
         self._overview_sarv_locality_id = None
         self._fill_pairs(self.overview, attributes, role)
-        self.profile.set_core_applicable(role == "boreholes")
+        self.profile.set_core_applicable(
+            role in {"boreholes", "sarv_drillcores"}
+        )
         self.profile.set_total_depth(
             attributes.get("pikkus") or attributes.get("vertikaalne_ulatus")
+            or attributes.get("depth")
         )
         self.profile.set_units([])
         self.profile.set_core_boxes([])
@@ -1828,7 +1831,11 @@ class DetailWidget(QWidget):
             elif key_lower == "kande_alus_nr":
                 url = f"https://fond.egt.ee/fond/egf/{display}"
             elif key_lower == "sarv_id":
-                sarv_path = "site" if role == "sarv_sites" else "locality"
+                sarv_path = (
+                    "site" if role == "sarv_sites"
+                    else "drillcore" if role == "sarv_drillcores"
+                    else "locality"
+                )
                 url = f"https://geoloogia.info/{sarv_path}/{display}"
             if url:
                 self._set_link_widget(table, row_index, 1, display, url)

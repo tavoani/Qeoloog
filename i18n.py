@@ -48,6 +48,7 @@ EN = {
     "Vaatluspunktid": "Observation points",
     "SARV - lokaliteedid": "SARV - localities",
     "SARV - uuringupunktid": "SARV - research sites",
+    "SARV - puursüdamikud": "SARV - drill cores",
     "EGT kihid": "EGS layers",
     "Ulatus": "Extent",
     "Klõpsa objektil ja ava andmed": "Click an object to open its data",

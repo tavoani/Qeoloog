@@ -112,7 +112,7 @@ DEFAULT_LAYERS = (
     ),
     _layer(
         "SK", "SARV - kohad", "SARV - locations", "SARV",
-        "https://rwapi.geoloogia.info/api/v1/public", "localities,sites",
+        "https://rwapi.geoloogia.info/api/v1/public", "localities,sites,drillcores",
         color="#356f92", role="sarv_points", home_group="geology", placement="toolbar",
     ),
     _layer(

@@ -334,9 +334,13 @@ class QeoloogPlugin:
                     layer.setName(self.t("SARV - lokaliteedid"))
                 elif role == "sarv_sites":
                     layer.setName(self.t("SARV - uuringupunktid"))
+                elif role == "sarv_drillcores":
+                    layer.setName(self.t("SARV - puursüdamikud"))
                 else:
                     layer.setName(self.display_name(definition))
-                if role in {"sarv_localities", "sarv_sites"}:
+                if role in {
+                    "sarv_localities", "sarv_sites", "sarv_drillcores",
+                }:
                     node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
                     if node and node.parent():
                         node.parent().setName(self.display_name(definition))
@@ -548,8 +552,9 @@ class QeoloogPlugin:
             return True
 
         self.message(
-            "Loading SARV localities and research sites..." if self.language == "en"
-            else "SARV-i lokaliteete ja uuringupunkte laaditakse..."
+            "Loading SARV localities, research sites and drill cores..."
+            if self.language == "en" else
+            "SARV-i lokaliteete, uuringupunkte ja puursüdamikke laaditakse..."
         )
 
         def load_failed(error):
@@ -559,8 +564,8 @@ class QeoloogPlugin:
             )
 
         self._ensure_sarv_point_cache(
-            lambda localities, sites: self._create_sarv_point_layers(
-                definition, localities, sites,
+            lambda localities, sites, drillcores: self._create_sarv_point_layers(
+                definition, localities, sites, drillcores,
             ),
             load_failed,
         )
@@ -580,11 +585,12 @@ class QeoloogPlugin:
         def completed(kind):
             def handler(rows):
                 result[kind] = rows
-                if len(result) != 2 or failed["value"]:
+                if len(result) != 3 or failed["value"]:
                     return
                 self._sarv_points_loading = False
                 self._sarv_point_cache = (
                     result["localities"], result["sites"],
+                    result["drillcores"],
                 )
                 waiters, self._sarv_point_waiters = self._sarv_point_waiters, []
                 for callback, _ in waiters:
@@ -616,8 +622,19 @@ class QeoloogPlugin:
             completed("sites"),
             load_failed,
         )
+        self.network.query_sarv_all(
+            "drillcores",
+            (
+                "id", "name", "name_en", "number", "locality", "depth",
+                "depository", "location", "storage",
+            ),
+            completed("drillcores"),
+            load_failed,
+        )
 
-    def _create_sarv_point_layers(self, definition, localities, sites):
+    def _create_sarv_point_layers(
+        self, definition, localities, sites, drillcores,
+    ):
         project = QgsProject.instance()
         source_id = self._source_id(definition)
         if any(
@@ -626,6 +643,27 @@ class QeoloogPlugin:
         ):
             self.sync_dropdown_checks()
             return
+        localities_by_id = {
+            str(row.get("id")): row for row in localities if row.get("id")
+        }
+        drillcore_points = []
+        for row in drillcores:
+            locality = row.get("locality")
+            locality_id = locality.get("id") if isinstance(locality, dict) else locality
+            locality_row = localities_by_id.get(str(locality_id))
+            if not locality_row:
+                continue
+            point = dict(row)
+            point.update({
+                "latitude": locality_row.get("latitude"),
+                "longitude": locality_row.get("longitude"),
+                "land_board_id": locality_row.get("land_board_id"),
+                "locality": locality_id,
+                "type": "drillcore",
+                "depth": row.get("depth") or locality_row.get("depth"),
+            })
+            drillcore_points.append(point)
+
         layers = (
             self._sarv_memory_layer(
                 self.t("SARV - lokaliteedid"), "sarv_localities",
@@ -634,6 +672,10 @@ class QeoloogPlugin:
             self._sarv_memory_layer(
                 self.t("SARV - uuringupunktid"), "sarv_sites",
                 sites, "#8b5aa3", "diamond",
+            ),
+            self._sarv_memory_layer(
+                self.t("SARV - puursüdamikud"), "sarv_drillcores",
+                drillcore_points, "#d57b2a", "hexagon",
             ),
         )
         for layer in layers:
@@ -644,17 +686,19 @@ class QeoloogPlugin:
         group = root.findGroup(self.display_name(definition))
         if not group or group.children():
             group = root.insertGroup(0, self.display_name(definition))
-        for layer in layers:
+        for layer in reversed(layers):
             group.addLayer(layer)
         self._ensure_egt_points_on_top()
-        self.iface.setActiveLayer(layers[0])
+        self.iface.setActiveLayer(layers[2])
         self.success(
             (
                 f"Loaded {layers[0].featureCount()} SARV localities and "
-                f"{layers[1].featureCount()} research sites."
+                f"{layers[1].featureCount()} research sites and "
+                f"{layers[2].featureCount()} drill cores."
                 if self.language == "en" else
                 f"Laaditi {layers[0].featureCount()} SARV-i lokaliteeti ja "
-                f"{layers[1].featureCount()} uuringupunkti."
+                f"{layers[1].featureCount()} uuringupunkti ning "
+                f"{layers[2].featureCount()} puursüdamikku."
             )
         )
         self.sync_dropdown_checks()
@@ -709,15 +753,25 @@ class QeoloogPlugin:
                     type_value.get("value_en") if self.language == "en"
                     else type_value.get("value")
                 ) or type_value.get("name") or type_value.get("id")
+            depth = row.get("depth")
+            try:
+                depth = float(depth) if depth not in (None, "") else None
+            except (TypeError, ValueError):
+                depth = None
             feature = QgsFeature(layer.fields())
             feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(longitude, latitude)))
+            source_type = {
+                "sarv_localities": "locality",
+                "sarv_sites": "site",
+                "sarv_drillcores": "drillcore",
+            }.get(role, "")
             feature.setAttributes([
                 row.get("id"),
-                "locality" if role == "sarv_localities" else "site",
+                source_type,
                 row.get("name"),
                 row.get("name_en"),
                 row.get("number"),
-                row.get("depth"),
+                depth,
                 type_value,
                 row.get("id") if role == "sarv_localities" else locality_id,
                 row.get("land_board_id"),
@@ -1030,7 +1084,16 @@ class QeoloogPlugin:
         tolerance = canvas.mapUnitsPerPixel() * 8
         click_geometry = QgsGeometry.fromPointXY(map_point)
         best = None
-        for role in ("boreholes", "observations", "sarv_localities", "sarv_sites"):
+        roles = [
+            "boreholes", "observations", "sarv_drillcores",
+            "sarv_sites", "sarv_localities",
+        ]
+        active_layer = self.iface.activeLayer()
+        active_role = self._layer_role(active_layer) if active_layer else ""
+        if active_role in roles:
+            roles.remove(active_role)
+            roles.insert(0, active_role)
+        for role in roles:
             for layer in self._role_layers(role):
                 node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
                 if node and not node.isVisible():
@@ -1072,7 +1135,9 @@ class QeoloogPlugin:
             return
         _, role, layer, feature = best
         attributes = {field.name(): feature.attribute(field.name()) for field in layer.fields()}
-        if role in {"sarv_localities", "sarv_sites"}:
+        if role in {
+            "sarv_localities", "sarv_sites", "sarv_drillcores",
+        }:
             name = (
                 attributes.get("name_en") if self.language == "en"
                 else attributes.get("name")
@@ -1157,7 +1222,11 @@ class QeoloogPlugin:
             return handler
 
         sarv_id = attributes.get("sarv_id")
-        endpoint = "localities" if role == "sarv_localities" else "sites"
+        endpoint = {
+            "sarv_localities": "localities",
+            "sarv_sites": "sites",
+            "sarv_drillcores": "drillcores",
+        }.get(role, "localities")
 
         def entity_loaded(entity):
             if not isinstance(entity, dict):
@@ -1169,9 +1238,11 @@ class QeoloogPlugin:
                 if not isinstance(value, list)
             }
             overview["sarv_id"] = entity.get("id")
-            overview["source_type"] = (
-                "locality" if role == "sarv_localities" else "site"
-            )
+            overview["source_type"] = {
+                "sarv_localities": "locality",
+                "sarv_sites": "site",
+                "sarv_drillcores": "drillcore",
+            }.get(role, "locality")
             display_name = (
                 entity.get("name_en") if self.language == "en"
                 else entity.get("name")
@@ -1181,7 +1252,14 @@ class QeoloogPlugin:
             details.set_attachments([])
             details.set_ready(str(display_name))
 
-            candidates = self._egt_candidates_for_sarv_point(entity)
+            locality = (
+                entity if role == "sarv_localities"
+                else entity.get("locality")
+            )
+            match_entity = (
+                locality if isinstance(locality, dict) else entity
+            )
+            candidates = self._egt_candidates_for_sarv_point(match_entity)
             confirmed = [item for item in candidates if item.get("confirmed")]
             if len(confirmed) == 1:
                 details.add_match_candidates(
@@ -1192,12 +1270,14 @@ class QeoloogPlugin:
                     "Võimalik EGT vaste", candidates[:5], self._open_egt_candidate,
                 )
 
-            locality = entity if role == "sarv_localities" else entity.get("locality")
             locality_id = locality.get("id") if isinstance(locality, dict) else locality
             if locality_id:
                 self._load_sarv_details(
                     token, {"sarv_id": locality_id}, details, failed,
                     trusted_sarv_id=True,
+                    selected_drillcore_id=(
+                        sarv_id if role == "sarv_drillcores" else None
+                    ),
                 )
             else:
                 details.set_sarv_core([])
@@ -1523,7 +1603,7 @@ class QeoloogPlugin:
 
     def _load_sarv_details(
         self, token, attributes, details, failed, trusted_sarv_id=False,
-        egt_role="",
+        egt_role="", selected_drillcore_id=None,
     ):
         def current(callback):
             return lambda payload: callback(payload) if token == self._detail_token else None
@@ -1554,6 +1634,11 @@ class QeoloogPlugin:
 
             def drillcores_loaded(payload):
                 cores = self._sarv_rows(payload)
+                if selected_drillcore_id not in (None, ""):
+                    cores = [
+                        core for core in cores
+                        if str(core.get("id")) == str(selected_drillcore_id)
+                    ]
                 if not cores:
                     details.set_sarv_core([])
                     details.set_sarv_core_images([])
@@ -1759,7 +1844,7 @@ class QeoloogPlugin:
             )
             load_candidate(candidate)
 
-        def cache_loaded(localities, sites):
+        def cache_loaded(localities, sites, drillcores):
             if token != self._detail_token:
                 return
             candidates = self._sarv_candidates_for_egt(

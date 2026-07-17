@@ -1,4 +1,4 @@
-# Qeoloog 3.6.0
+# Qeoloog 3.6.1
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -28,7 +28,7 @@ Vaikimisi on ribal seitse otsenuppu:
 | HK | hübriidkaart | WMS |
 | PA | EGT puuraugud | WFS |
 | VP | EGT vaatluspunktid | WFS |
-| SK | SARV lokaliteedid ja uuringupunktid | SARV API |
+| SK | SARV lokaliteedid, uuringupunktid ja puursüdamikud | SARV API |
 | AP | EGT 1:50 000 aluspõhja avamused | WMS |
 
 **LK** avab lisakihtide menüü. Seal on aluskaardid, geoloogia, uuringute ja
@@ -85,8 +85,11 @@ galeriimenüüst sobiva. SARV kastipiire saab läbilõikel eraldi sisse ja välj
 lülitada ning need on EGT piiridest eristatud sinise punktiiriga. EGT ja SARV
 kaste ei liideta automaatselt. SARV andmete sidumine kasutab avalikku SARV API-t
 ning ainult üheselt tuvastatud leiukoha vastet. SK nupp laadib eraldi
-punktikihtidena SARV lokaliteedid ja uuringupunktid. Neid saab sama
-kaardiklõpsu tööriistaga avada nagu EGT punkte.
+punktikihtidena SARV lokaliteedid, uuringupunktid ja puursüdamikud.
+Puursüdamik kuvatakse seotud lokaliteedi koordinaadil; koordinaadita kirjeid
+kaardile ei lisata. Puursüdamiku punktilt saab avada valitud südamiku kastid,
+pildid ning lokaliteediga seotud proovid, analüüsid, eksemplarid ja kirjanduse.
+Neid kihte saab sama kaardiklõpsu tööriistaga avada nagu EGT punkte.
 
 EGT ja SARV automaatne seos kinnitatakse ainult tugeva ning ühese tõendi korral,
 näiteks ametliku tunnuse või lähestikku asuvate samanimeliste/-numbriliste
