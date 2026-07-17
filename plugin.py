@@ -1,5 +1,8 @@
 """Qeoloog - configurable Estonian geoscience layers and borehole explorer."""
 
+import csv
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from unicodedata import normalize
 from urllib.parse import quote
@@ -115,6 +118,65 @@ class QeoloogPlugin:
 
     def t(self, text):
         return translate(text, self.language)
+
+    def export_sarv_matches(self, path):
+        """Export all locally persisted EGT–SARV corrections as CSV or JSON."""
+        rows = []
+        for match_key, value in sorted(self.sarv_matches.items()):
+            if not isinstance(value, dict):
+                continue
+            key_parts = str(match_key).split(":", 2)
+            role = key_parts[0] if key_parts else ""
+            key_type = key_parts[1] if len(key_parts) > 1 else ""
+            egt_id = key_parts[2] if len(key_parts) > 2 else ""
+            object_type = value.get("source_type") or ""
+            object_id = value.get("sarv_id") or ""
+            rows.append({
+                "egt_role": role,
+                "egt_key_type": key_type,
+                "egt_id": egt_id,
+                "gea_id": value.get("gea_id") or (
+                    egt_id if key_type == "gea" else ""
+                ),
+                "original_gea_sarv_id": value.get("original_sarv_id") or "",
+                "sarv_object_type": object_type,
+                "sarv_object_id": object_id,
+                "sarv_drillcore_id": (
+                    object_id if object_type == "drillcore" else ""
+                ),
+                "source": value.get("source") or "local_override",
+                "updated_at": value.get("updated_at") or "",
+            })
+        target = Path(path)
+        if target.suffix.casefold() == ".json":
+            target.write_text(
+                json.dumps({
+                    "format": "Qeoloog EGT–SARV link corrections",
+                    "version": 1,
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "links": rows,
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            if target.suffix.casefold() != ".csv":
+                target = target.with_suffix(".csv")
+            fieldnames = (
+                "egt_role", "egt_key_type", "egt_id", "gea_id",
+                "original_gea_sarv_id", "sarv_object_type",
+                "sarv_object_id", "sarv_drillcore_id", "source",
+                "updated_at",
+            )
+            with target.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        self.success(
+            f"Exported {len(rows)} SARV links to {target}."
+            if self.language == "en" else
+            f"Eksporditi {len(rows)} SARV seost faili {target}."
+        )
+        return target
 
     def decode_egt(self, table_id, field, value):
         """Return an official EGT domain label while preserving unknown values."""
@@ -2987,51 +3049,70 @@ class QeoloogPlugin:
                     request_failed("SARV locality", clear_sarv),
                 )
 
-        def remove_manual(candidate):
+        def saved_match():
+            value = self.sarv_matches.get(match_key) if match_key else None
+            return value if isinstance(value, dict) else None
+
+        def persist_match(source_type, source_id):
+            if not match_key:
+                return
+            self.sarv_matches[match_key] = {
+                "source_type": source_type,
+                "sarv_id": source_id,
+                "gea_id": str(attributes.get("gea_id") or ""),
+                "original_sarv_id": sarv_id,
+                "source": "local_override",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            PluginSettings.save_sarv_matches(self.sarv_matches)
+
+        def remove_manual(candidate=None):
             if match_key:
                 self.sarv_matches.pop(match_key, None)
                 PluginSettings.save_sarv_matches(self.sarv_matches)
             self.success(
-                "Manual SARV match removed. Reopen the EGT point to find candidates."
+                "Local SARV correction removed; the GEA link is active again."
                 if self.language == "en" else
-                "Käsitsi kinnitatud SARV vaste eemaldati. Kandidaatide leidmiseks ava EGT punkt uuesti."
+                "Kohalik SARV parandus eemaldati; GEA seos on taas aktiivne."
             )
+            refresh_resolution()
 
         def confirm_candidate(candidate):
             if not match_key:
                 return
-            self.sarv_matches[match_key] = {
-                "source_type": candidate.get("source_type"),
-                "sarv_id": candidate.get("sarv_id"),
-            }
-            PluginSettings.save_sarv_matches(self.sarv_matches)
+            persist_match(
+                candidate.get("source_type"), candidate.get("sarv_id"),
+            )
             candidate["confirmed"] = True
             candidate["manual"] = True
             candidate["evidence"] = self.t("Käsitsi kinnitatud")
             self.success(
-                "SARV match saved." if self.language == "en"
-                else "SARV vaste salvestati."
+                "SARV match saved locally." if self.language == "en"
+                else "SARV vaste salvestati kohalikult."
             )
-            load_candidate(candidate)
+            refresh_resolution(candidate.get("row"))
 
-        def cache_loaded(localities, sites, drillcores):
-            if token != self._detail_token:
+        def cache_loaded(localities, sites, drillcores, generation):
+            if (
+                token != self._detail_token
+                or generation != resolution_state["generation"]
+            ):
                 return
             candidates = self._sarv_candidates_for_egt(
                 localities, sites, attributes, drillcores,
             )
-            saved = self.sarv_matches.get(match_key) if match_key else None
-            if isinstance(saved, dict):
+            saved = saved_match()
+            if saved and saved.get("source_type") != "drillcore":
                 manual = next((
                     item for item in candidates
                     if item.get("source_type") == saved.get("source_type")
                     and str(item.get("sarv_id")) == str(saved.get("sarv_id"))
                 ), None)
                 if manual is None:
-                    source_rows = {
-                        "site": sites,
-                        "drillcore": drillcores,
-                    }.get(saved.get("source_type"), localities)
+                    source_rows = (
+                        sites if saved.get("source_type") == "site"
+                        else localities
+                    )
                     row = next((
                         item for item in source_rows
                         if str(item.get("id")) == str(saved.get("sarv_id"))
@@ -3044,15 +3125,13 @@ class QeoloogPlugin:
                 if manual:
                     manual["confirmed"] = True
                     manual["manual"] = True
-                    manual["evidence"] = self.t("Käsitsi kinnitatud")
+                    manual["evidence"] = self.t("Kohalik parandus")
                     details.add_match_candidates(
                         "Kinnitatud SARV vaste", [manual],
                         open_candidate, remove_callback=remove_manual,
                     )
                     load_candidate(manual)
                     return
-                self.sarv_matches.pop(match_key, None)
-                PluginSettings.save_sarv_matches(self.sarv_matches)
 
             confirmed = [
                 candidate for candidate in candidates
@@ -3071,50 +3150,135 @@ class QeoloogPlugin:
                     confirm_callback=confirm_candidate,
                 )
 
-        def use_point_cache():
+        def render_editor():
+            if not match_key:
+                return
+            saved = saved_match()
+            manual = bool(saved)
+            current_id = (
+                saved.get("sarv_id") if saved else sarv_id
+            )
+            details.add_sarv_match_editor(
+                current_id, manual, set_manual_drillcore,
+                remove_manual if manual else None,
+            )
+
+        def display_direct_core(core, manual, generation):
+            if (
+                token != self._detail_token
+                or generation != resolution_state["generation"]
+            ):
+                return
+            if not isinstance(core, dict) or not core.get("id"):
+                clear_sarv()
+                return
+            candidate = self._sarv_candidate(
+                core, "drillcore", attributes, allow_weak=True,
+            )
+            if not candidate:
+                clear_sarv()
+                return
+            candidate["confirmed"] = True
+            candidate["manual"] = manual
+            candidate["score"] = max(candidate.get("score", 0), 5000)
+            candidate["evidence"] = self.t(
+                "Kohalik parandus" if manual else "GEA SARV ID"
+            )
+            details.add_match_candidates(
+                "Kinnitatud SARV vaste", [candidate], open_candidate,
+            )
+            load_candidate(candidate)
+
+        def refresh_resolution(prefetched_core=None):
+            resolution_state["generation"] += 1
+            generation = resolution_state["generation"]
+            details.reset_match_rows()
+            clear_sarv()
+            render_editor()
+            saved = saved_match()
+            saved_is_core = (
+                saved and saved.get("source_type") == "drillcore"
+            )
+            effective_id = str(
+                saved.get("sarv_id") if saved_is_core
+                else "" if saved else sarv_id
+            ).strip()
+            valid_id = effective_id.isdigit() and int(effective_id) > 0
+            if valid_id:
+                if (
+                    isinstance(prefetched_core, dict)
+                    and str(prefetched_core.get("id")) == effective_id
+                ):
+                    display_direct_core(
+                        prefetched_core, bool(saved_is_core), generation,
+                    )
+                    return
+
+                def direct_loaded(core):
+                    display_direct_core(
+                        core, bool(saved_is_core), generation,
+                    )
+
+                def direct_failed(error):
+                    if (
+                        token == self._detail_token
+                        and generation == resolution_state["generation"]
+                    ):
+                        clear_sarv()
+                        failed("SARV drill core")(error)
+
+                self.network.query_sarv(
+                    f"drillcores/{effective_id}", {"expand": "*"},
+                    direct_loaded, direct_failed,
+                )
+                return
+
             self._ensure_sarv_point_cache(
-                cache_loaded,
+                lambda localities, sites, drillcores: cache_loaded(
+                    localities, sites, drillcores, generation,
+                ),
                 request_failed("SARV locations", clear_sarv),
             )
 
-        if (
-            egt_role in {"boreholes", "observations"}
-            and sarv_id.isdigit()
-            and int(sarv_id) > 0
-        ):
-            def direct_drillcore_loaded(core):
+        def set_manual_drillcore(source_id):
+            if not match_key:
+                return
+            source_id = int(source_id)
+            self.message(
+                f"Checking SARV drill core {source_id}..."
+                if self.language == "en" else
+                f"Kontrollitakse SARV puursüdamikku {source_id}..."
+            )
+
+            def verified(core):
                 if token != self._detail_token:
                     return
                 if not isinstance(core, dict) or not core.get("id"):
-                    clear_sarv()
+                    invalid("Invalid response")
                     return
-                candidate = self._sarv_candidate(
-                    core, "drillcore", attributes, allow_weak=True,
+                persist_match("drillcore", core.get("id"))
+                self.success(
+                    f"Local SARV correction saved: drill core {core.get('id')}."
+                    if self.language == "en" else
+                    f"Kohalik SARV parandus salvestati: puursüdamik {core.get('id')}."
                 )
-                if not candidate:
-                    clear_sarv()
-                    return
-                candidate["confirmed"] = True
-                candidate["score"] = max(candidate.get("score", 0), 5000)
-                candidate["evidence"] = self.t("GEA SARV ID")
-                details.add_match_candidates(
-                    "Kinnitatud SARV vaste", [candidate], open_candidate,
-                )
-                load_candidate(candidate)
+                refresh_resolution(core)
 
-            def direct_drillcore_failed(error):
+            def invalid(error):
                 if token == self._detail_token:
-                    clear_sarv()
-                    failed("SARV drill core")(error)
+                    self.warning(
+                        f"SARV drill core {source_id} was not found; the correction was not saved."
+                        if self.language == "en" else
+                        f"SARV puursüdamikku {source_id} ei leitud; parandust ei salvestatud."
+                    )
 
             self.network.query_sarv(
-                f"drillcores/{sarv_id}", {"expand": "*"},
-                current(direct_drillcore_loaded),
-                direct_drillcore_failed,
+                f"drillcores/{source_id}", {"expand": "*"},
+                verified, invalid,
             )
-            return
 
-        use_point_cache()
+        resolution_state = {"generation": 0}
+        refresh_resolution()
 
     def _sarv_candidates_for_egt(
         self, localities, sites, attributes, drillcores=(),

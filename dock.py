@@ -13,9 +13,11 @@ from qgis.PyQt.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDockWidget,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -222,8 +224,21 @@ class LayerConfigWidget(QWidget):
         self.toggle_mode.setChecked(self.plugin.toggle_mode)
         self.toggle_mode.toggled.connect(self.plugin.set_toggle_mode)
         form_host_layout.addWidget(self.toggle_mode)
+        export_button = QPushButton(t("Ekspordi SARV seosed…"))
+        export_button.clicked.connect(self._export_sarv_matches)
+        form_host_layout.addWidget(export_button)
         splitter.addWidget(form_host)
         splitter.setSizes([220, 360])
+
+    def _export_sarv_matches(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.plugin.t("Ekspordi SARV seosed"),
+            "qeoloog_sarv_seosed.csv",
+            "CSV (*.csv);;JSON (*.json)",
+        )
+        if path:
+            self.plugin.export_sarv_matches(path)
 
     def reload_list(self, select=None):
         self.list_widget.blockSignals(True)
@@ -1754,6 +1769,7 @@ class DetailWidget(QWidget):
         self._sarv_analysis_refs = {"sample": [], "specimen": []}
         self._overview_has_sarv_id = False
         self._overview_sarv_locality_id = None
+        self._overview_base_rows = 0
         for checkbox in self.core_sources.values():
             checkbox.toggled.connect(self._refresh_core)
         for checkbox in self.sample_sources.values():
@@ -1800,6 +1816,7 @@ class DetailWidget(QWidget):
         )
         self._overview_sarv_locality_id = None
         self._fill_pairs(self.overview, attributes, role)
+        self._overview_base_rows = self.overview.rowCount()
         self.profile.set_core_applicable(
             role in {"boreholes", "sarv_drillcores"}
         )
@@ -1867,7 +1884,7 @@ class DetailWidget(QWidget):
 
     def add_match_candidates(
         self, label, candidates, open_callback=None,
-        confirm_callback=None, remove_callback=None,
+        confirm_callback=None, remove_callback=None, edit_callback=None,
     ):
         for candidate in candidates:
             row = self.overview.rowCount()
@@ -1893,6 +1910,12 @@ class DetailWidget(QWidget):
                     lambda checked=False, item=candidate: open_callback(item)
                 )
                 layout.addWidget(button)
+            if edit_callback:
+                button = QPushButton(self.plugin.t("Muuda SARV seost"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: edit_callback(item)
+                )
+                layout.addWidget(button)
             if confirm_callback and not candidate.get("confirmed"):
                 button = QPushButton(self.plugin.t("Kinnita vaste"))
                 button.clicked.connect(
@@ -1907,6 +1930,58 @@ class DetailWidget(QWidget):
                 layout.addWidget(button)
             layout.addStretch(1)
             self.overview.setCellWidget(row, 1, host)
+        self.overview.resizeColumnsToContents()
+
+    def reset_match_rows(self):
+        """Remove inferred/match rows while retaining source attributes."""
+        self.overview.setRowCount(self._overview_base_rows)
+
+    def add_sarv_match_editor(
+        self, current_id, manual, edit_callback, reset_callback=None,
+    ):
+        row = self.overview.rowCount()
+        self.overview.insertRow(row)
+        self.overview.setItem(
+            row, 0, QTableWidgetItem(self.plugin.t("SARV seose haldus")),
+        )
+        host = QWidget()
+        layout = QHBoxLayout(host)
+        layout.setContentsMargins(4, 0, 4, 0)
+        if current_id:
+            prefix = (
+                self.plugin.t("Kohalik parandus")
+                if manual else self.plugin.t("GEA SARV ID")
+            )
+            layout.addWidget(QLabel(f"{prefix}: {current_id}"))
+        else:
+            layout.addWidget(QLabel(self.plugin.t("SARV puursüdamik pole seotud")))
+
+        def ask_for_id():
+            try:
+                initial = max(1, int(current_id or 1))
+            except (TypeError, ValueError):
+                initial = 1
+            value, accepted = QInputDialog.getInt(
+                self,
+                self.plugin.t("Määra SARV puursüdamik"),
+                self.plugin.t("SARV puursüdamiku ID"),
+                initial, 1, 2147483647, 1,
+            )
+            if accepted:
+                edit_callback(value)
+
+        button = QPushButton(
+            self.plugin.t("Muuda SARV seost")
+            if current_id else self.plugin.t("Lisa SARV seos")
+        )
+        button.clicked.connect(ask_for_id)
+        layout.addWidget(button)
+        if manual and reset_callback:
+            button = QPushButton(self.plugin.t("Taasta GEA seos"))
+            button.clicked.connect(reset_callback)
+            layout.addWidget(button)
+        layout.addStretch(1)
+        self.overview.setCellWidget(row, 1, host)
         self.overview.resizeColumnsToContents()
 
     def set_profile(self, units):

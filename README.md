@@ -1,4 +1,4 @@
-# Qeoloog 3.7.4
+# Qeoloog 3.8.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -16,6 +16,9 @@ and images, samples, analyses, specimens, attachments and literature.
 The plugin also provides configurable access to WMS and WFS services from the
 Estonian Land and Spatial Development Board (MaRu) and other public data
 providers. The user interface can be displayed in Estonian or English.
+Validated EGT–SARV drill-core link corrections can be stored locally, applied
+immediately to the combined detail view, restored to the original GEA link and
+exported together as CSV or JSON.
 
 ## Tööriistariba
 
@@ -49,6 +52,7 @@ Hammasratta alt saab:
 - lugeda GetCapabilities-kihiloendi;
 - muuta tähist, värvi, nime, URL-i, kihinime ja WMS-stiili;
 - lülitada sisse režiimi, kus otsenupu korduv vajutus eemaldab kihi;
+- eksportida kõik kohalikud EGT–SARV seoseparandused ühe CSV- või JSON-failina;
 - taastada Qeoloogi vaikekataloogi.
 
 Kihi kodurühm on pärast loomist lukus: näiteks katastriüksuseid ei saa tõsta
@@ -119,6 +123,15 @@ tunnuse või lähestikku asuvate samanimeliste/-numbriliste punktide põhjal.
 Ebaselged vasted kuvatakse kandidaatide loendina ega lisa andmeid automaatselt.
 Kasutaja saab kandidaadi käsitsi kinnitada; kinnitus salvestatakse QGIS-i
 kasutajaprofiili ja seda saab hiljem eemaldada.
+
+Üldandmete **SARV seose haldus** real saab määrata või muuta EGT objektiga
+seotud SARV puursüdamiku ID-d. Qeoloog kontrollib enne salvestamist, et selline
+puursüdamik SARV-is eksisteerib. Parandus salvestub kohaliku QGIS-i
+kasutajaprofiili koos EGT võtme, algse GEA `sarv_id`, parandatud drillcore-ID ja
+muutmise ajaga ning läheb kohe seotud andmete laadimisel käiku. Nii saab näiteks
+EGT läbilõiget ja SARV puursüdamikukaste samas vaates koos kuvada. **Taasta GEA
+seos** eemaldab kohaliku paranduse. Seadete paanis saab kõik parandused
+koondatult CSV- või JSON-faili eksportida.
 
 Läbilõiget saab vertikaalselt suumida Windowsis `Ctrl` + kerimisratas ja macOS-is
 `Command` + kerimisratas. Tulba laius ei muutu. Uue objekti avamisel jääb viimati
