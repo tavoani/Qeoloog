@@ -1,4 +1,4 @@
-# Qeoloog 3.7.1
+# Qeoloog 3.7.2
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -106,8 +106,9 @@ SARV serverist alles filtri rakendamisel.
 kohad nime, numbri või ID, kaardiulatuse, sügavuse ning proovi- või
 analüüsitunnuste järgi. Otsingus saab eraldi valida objektitüübid ning
 puursüdamiku, proovide ja analüüside olemasolu. Tulemust saab nupust kaardil
-avada ja objektivaatesse laadida. Kuvatakse kuni 500 esimest vastet ning
-allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
+avada ja objektivaatesse laadida ilma kaardi mõõtkava muutmata. Täpsed numbri-
+ja ID-vasted ning nimevasted kuvatakse enne osalisi vasteid. Kuvatakse kuni 500
+esimest vastet ning allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
 
 EGT ja SARV automaatne seos kinnitatakse ainult tugeva ning ühese tõendi korral,
 näiteks ametliku tunnuse või lähestikku asuvate samanimeliste/-numbriliste

@@ -804,6 +804,7 @@ class QeoloogPlugin:
                 "latitude": locality_row.get("latitude"),
                 "longitude": locality_row.get("longitude"),
                 "land_board_id": locality_row.get("land_board_id"),
+                "number": row.get("number") or locality_row.get("number"),
                 "locality": locality_id,
                 "type": "drillcore",
                 "depth": row.get("depth") or locality_row.get("depth"),
@@ -1751,7 +1752,7 @@ class QeoloogPlugin:
                 })
             allowed_egt = set.intersection(*groups) if groups else None
 
-        text_query = str(criteria.get("text") or "").casefold()
+        text_query = str(criteria.get("text") or "")
         depth_min = criteria.get("depth_min")
         depth_max = criteria.get("depth_max")
         canvas_extent = self.iface.mapCanvas().extent()
@@ -1835,13 +1836,26 @@ class QeoloogPlugin:
                         else attributes.get("name") if is_sarv
                         else attributes.get("nimi")
                     ) or attributes.get("name") or attributes.get("alias") or attributes.get("number") or object_id
-                    searchable = " ".join(
-                        str(value) for value in (
-                            name, object_id, attributes.get("number"),
-                            attributes.get("gea_id"), attributes.get("land_board_id"),
-                        ) if value not in (None, "")
-                    ).casefold()
-                    if text_query and text_query not in searchable:
+                    relevance = self._search_relevance(
+                        text_query,
+                        primary_values=(
+                            name, attributes.get("alias"),
+                        ),
+                        identifier_values=(
+                            object_id, attributes.get("number"),
+                            attributes.get("korrastatud_nr"),
+                            attributes.get("gea_id"),
+                            attributes.get("ma_orig_id"),
+                            attributes.get("land_board_id"),
+                            attributes.get("kande_alus_nr"),
+                        ),
+                        other_values=(
+                            attributes.get("name"),
+                            attributes.get("name_en"),
+                            attributes.get("type"),
+                        ),
+                    )
+                    if relevance is None:
                         continue
                     rows.append({
                         "source": "SARV" if is_sarv else "EGT",
@@ -1858,35 +1872,37 @@ class QeoloogPlugin:
                         "_layer_id": layer.id(),
                         "_feature_id": int(feature.id()),
                         "_role": role,
+                        "_search_score": relevance,
                     })
-                    if len(rows) >= 500:
-                        break
-                if len(rows) >= 500:
-                    break
-            if len(rows) >= 500:
-                break
         rows.sort(key=lambda row: (
-            str(row.get("source")), str(row.get("name") or "").casefold()
+            -int(row.get("_search_score") or 0),
+            str(row.get("source")),
+            str(row.get("name") or "").casefold(),
         ))
+        total_count = len(rows)
+        rows = rows[:500]
         missing = []
         if wants_egt and "EGT" not in loaded_sources:
             missing.append("EGT")
         if wants_sarv and "SARV" not in loaded_sources:
             missing.append("SARV")
         message = (
-            f"{len(rows)} {self.t('tulemust')}"
+            f"{total_count} {self.t('tulemust')}"
             + (
                 ". " + self.t("Laadi otsimiseks esmalt kihid: ")
                 + ", ".join(missing)
                 if missing else ""
             )
-            + (f". {self.t('Kuvatakse esimesed 500.')}" if len(rows) >= 500 else "")
+            + (
+                f". {self.t('Kuvatakse esimesed 500.')}"
+                if total_count > 500 else ""
+            )
         )
         callback(rows, message)
 
     def _resolve_sarv_search_allowed(self, criteria, success, failure):
         candidate = {"locality": set(), "site": set()}
-        text_query = str(criteria.get("text") or "").casefold()
+        text_query = str(criteria.get("text") or "")
         depth_min = criteria.get("depth_min")
         depth_max = criteria.get("depth_max")
         for role in ("sarv_localities", "sarv_sites", "sarv_drillcores"):
@@ -1912,14 +1928,20 @@ class QeoloogPlugin:
                         attributes.get("name_en") if self.language == "en"
                         else attributes.get("name")
                     ) or attributes.get("name") or attributes.get("number")
-                    searchable = " ".join(
-                        str(value) for value in (
-                            name, attributes.get("number"),
+                    if self._search_relevance(
+                        text_query,
+                        primary_values=(name,),
+                        identifier_values=(
+                            attributes.get("number"),
                             attributes.get("sarv_id"),
                             attributes.get("land_board_id"),
-                        ) if value not in (None, "")
-                    ).casefold()
-                    if text_query and text_query not in searchable:
+                        ),
+                        other_values=(
+                            attributes.get("name"),
+                            attributes.get("name_en"),
+                            attributes.get("type"),
+                        ),
+                    ) is None:
                         continue
                     depth = attributes.get("depth")
                     try:
@@ -2123,9 +2145,7 @@ class QeoloogPlugin:
                 QgsProject.instance(),
             ))
             point = geometry.asPoint()
-            extent = canvas.extent()
-            extent.scale(0.25, point)
-            canvas.setExtent(extent)
+            canvas.setCenter(QgsPointXY(point))
             canvas.refresh()
         except (QgsCsException, ValueError):
             pass
@@ -3207,6 +3227,51 @@ class QeoloogPlugin:
     def _normalized(value):
         text = normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
         return " ".join(text.casefold().split())
+
+    @classmethod
+    def _search_relevance(
+        cls, query, primary_values=(), identifier_values=(),
+        other_values=(),
+    ):
+        """Return a deterministic relevance score, or None when not matched."""
+        normalized_query = cls._normalized(query)
+        if not normalized_query:
+            return 0
+
+        def values(items):
+            normalized = []
+            for value in items:
+                if value in (None, ""):
+                    continue
+                text = cls._normalized(value)
+                if text:
+                    normalized.append(text)
+            return normalized
+
+        primary = values(primary_values)
+        identifiers = values(identifier_values)
+        others = values(other_values)
+        searchable = primary + identifiers + others
+        tokens = normalized_query.split()
+        if not searchable or not all(
+            any(token in value for value in searchable)
+            for token in tokens
+        ):
+            return None
+
+        if normalized_query in identifiers:
+            return 1000
+        if normalized_query in primary:
+            return 950
+        if any(value.startswith(normalized_query) for value in primary):
+            return 850
+        if any(normalized_query in value for value in primary):
+            return 800
+        if any(value.startswith(normalized_query) for value in identifiers):
+            return 650
+        if any(normalized_query in value for value in searchable):
+            return 600
+        return 500
 
     @staticmethod
     def _arcgis_rows(payload):
