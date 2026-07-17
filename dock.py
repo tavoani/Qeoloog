@@ -1794,7 +1794,10 @@ class DetailWidget(QWidget):
 
     def show_loading(self, name, attributes, role):
         self.header.setText(f"{name} — {self.plugin.t('seotud andmeid laaditakse…')}")
-        self._overview_has_sarv_id = bool(str(attributes.get("sarv_id") or "").strip())
+        sarv_id = str(attributes.get("sarv_id") or "").strip()
+        self._overview_has_sarv_id = (
+            sarv_id.isdigit() and int(sarv_id) > 0
+        )
         self._overview_sarv_locality_id = None
         self._fill_pairs(self.overview, attributes, role)
         self.profile.set_core_applicable(
@@ -1885,7 +1888,7 @@ class DetailWidget(QWidget):
                 evidence_label.setStyleSheet("color: #666666;")
                 layout.addWidget(evidence_label)
             if open_callback:
-                button = QPushButton(self.plugin.t("Ava"))
+                button = QPushButton(self.plugin.t("Ava rakenduses"))
                 button.clicked.connect(
                     lambda checked=False, item=candidate: open_callback(item)
                 )
@@ -2228,10 +2231,15 @@ class DetailWidget(QWidget):
             elif key_lower == "sarv_id":
                 sarv_path = (
                     "site" if role == "sarv_sites"
-                    else "drillcore" if role == "sarv_drillcores"
-                    else "locality"
+                    else "locality" if role == "sarv_localities"
+                    else "drillcore"
                 )
-                url = f"https://geoloogia.info/{sarv_path}/{display}"
+                try:
+                    valid_sarv_id = int(str(display)) > 0
+                except (TypeError, ValueError):
+                    valid_sarv_id = False
+                if valid_sarv_id:
+                    url = f"https://geoloogia.info/{sarv_path}/{display}"
             if url:
                 self._set_link_widget(table, row_index, 1, display, url)
             else:

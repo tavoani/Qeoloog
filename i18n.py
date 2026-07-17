@@ -158,6 +158,7 @@ EN = {
     "Kinnitatud SARV vaste": "Confirmed SARV match",
     "Võimalik SARV vaste": "Possible SARV match",
     "Ava": "Open",
+    "Ava rakenduses": "Open in application",
     "Kinnita vaste": "Confirm match",
     "Eemalda vaste": "Remove match",
     "Käsitsi kinnitatud": "Manually confirmed",
@@ -168,6 +169,8 @@ EN = {
     "number matches": "number matches",
     "lokaliteet": "locality",
     "uuringupunkt": "research site",
+    "puursüdamik": "drill core",
+    "GEA SARV ID": "GEA SARV ID",
 }
 
 

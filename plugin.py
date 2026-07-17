@@ -2756,7 +2756,7 @@ class QeoloogPlugin:
                 failed(label)(error)
             return handler
 
-        def load_locality(locality):
+        def load_locality(locality, drillcore_id=None):
             locality_id = locality.get("id")
             if not locality_id:
                 clear_sarv()
@@ -2765,10 +2765,15 @@ class QeoloogPlugin:
 
             def drillcores_loaded(payload):
                 cores = self._sarv_rows(payload)
-                if selected_drillcore_id not in (None, ""):
+                effective_drillcore_id = (
+                    drillcore_id
+                    if drillcore_id not in (None, "")
+                    else selected_drillcore_id
+                )
+                if effective_drillcore_id not in (None, ""):
                     cores = [
                         core for core in cores
-                        if str(core.get("id")) == str(selected_drillcore_id)
+                        if str(core.get("id")) == str(effective_drillcore_id)
                     ]
                 if not cores:
                     details.set_sarv_core([])
@@ -2904,9 +2909,10 @@ class QeoloogPlugin:
 
         def open_candidate(candidate):
             source_type = candidate.get("source_type")
-            role = (
-                "sarv_sites" if source_type == "site" else "sarv_localities"
-            )
+            role = {
+                "site": "sarv_sites",
+                "drillcore": "sarv_drillcores",
+            }.get(source_type, "sarv_localities")
             row = dict(candidate.get("row") or {})
             row["sarv_id"] = candidate.get("sarv_id")
             self._load_sarv_point_details(
@@ -2941,6 +2947,39 @@ class QeoloogPlugin:
                     current(site_loaded),
                     request_failed("SARV site", clear_sarv),
                 )
+            elif source_type == "drillcore":
+                def drillcore_loaded(core):
+                    if token != self._detail_token or not isinstance(core, dict):
+                        return
+                    locality = core.get("locality")
+                    locality_id = (
+                        locality.get("id") if isinstance(locality, dict)
+                        else locality
+                    )
+                    if not locality_id:
+                        clear_sarv()
+                        return
+                    self.network.query_sarv(
+                        f"localities/{locality_id}", {"expand": "*"},
+                        current(
+                            lambda row: load_locality(row, source_id)
+                        ),
+                        request_failed("SARV locality", clear_sarv),
+                    )
+
+                cached_core = candidate.get("row")
+                cached_locality = (
+                    cached_core.get("locality")
+                    if isinstance(cached_core, dict) else None
+                )
+                if cached_locality:
+                    drillcore_loaded(cached_core)
+                else:
+                    self.network.query_sarv(
+                        f"drillcores/{source_id}", {"expand": "*"},
+                        current(drillcore_loaded),
+                        request_failed("SARV drill core", clear_sarv),
+                    )
             else:
                 self.network.query_sarv(
                     f"localities/{source_id}", {"expand": "*"},
@@ -2979,7 +3018,7 @@ class QeoloogPlugin:
             if token != self._detail_token:
                 return
             candidates = self._sarv_candidates_for_egt(
-                localities, sites, attributes,
+                localities, sites, attributes, drillcores,
             )
             saved = self.sarv_matches.get(match_key) if match_key else None
             if isinstance(saved, dict):
@@ -2989,10 +3028,10 @@ class QeoloogPlugin:
                     and str(item.get("sarv_id")) == str(saved.get("sarv_id"))
                 ), None)
                 if manual is None:
-                    source_rows = (
-                        sites if saved.get("source_type") == "site"
-                        else localities
-                    )
+                    source_rows = {
+                        "site": sites,
+                        "drillcore": drillcores,
+                    }.get(saved.get("source_type"), localities)
                     row = next((
                         item for item in source_rows
                         if str(item.get("id")) == str(saved.get("sarv_id"))
@@ -3032,13 +3071,56 @@ class QeoloogPlugin:
                     confirm_callback=confirm_candidate,
                 )
 
-        self._ensure_sarv_point_cache(
-            cache_loaded,
-            request_failed("SARV locations", clear_sarv),
-        )
+        def use_point_cache():
+            self._ensure_sarv_point_cache(
+                cache_loaded,
+                request_failed("SARV locations", clear_sarv),
+            )
 
-    def _sarv_candidates_for_egt(self, localities, sites, attributes):
+        if (
+            egt_role in {"boreholes", "observations"}
+            and sarv_id.isdigit()
+            and int(sarv_id) > 0
+        ):
+            def direct_drillcore_loaded(core):
+                if token != self._detail_token:
+                    return
+                if not isinstance(core, dict) or not core.get("id"):
+                    clear_sarv()
+                    return
+                candidate = self._sarv_candidate(
+                    core, "drillcore", attributes, allow_weak=True,
+                )
+                if not candidate:
+                    clear_sarv()
+                    return
+                candidate["confirmed"] = True
+                candidate["score"] = max(candidate.get("score", 0), 5000)
+                candidate["evidence"] = self.t("GEA SARV ID")
+                details.add_match_candidates(
+                    "Kinnitatud SARV vaste", [candidate], open_candidate,
+                )
+                load_candidate(candidate)
+
+            def direct_drillcore_failed(error):
+                if token == self._detail_token:
+                    clear_sarv()
+                    failed("SARV drill core")(error)
+
+            self.network.query_sarv(
+                f"drillcores/{sarv_id}", {"expand": "*"},
+                current(direct_drillcore_loaded),
+                direct_drillcore_failed,
+            )
+            return
+
+        use_point_cache()
+
+    def _sarv_candidates_for_egt(
+        self, localities, sites, attributes, drillcores=(),
+    ):
         candidates = []
+        direct_core_candidate = None
         for source_type, rows in (
             ("locality", localities), ("site", sites),
         ):
@@ -3048,7 +3130,33 @@ class QeoloogPlugin:
                 )
                 if candidate:
                     candidates.append(candidate)
+        sarv_id = str(attributes.get("sarv_id") or "").strip()
+        valid_sarv_id = sarv_id.isdigit() and int(sarv_id) > 0
+        if valid_sarv_id:
+            core = next((
+                row for row in drillcores
+                if str(row.get("id")) == sarv_id
+            ), None)
+            if core:
+                candidate = self._sarv_candidate(
+                    core, "drillcore", attributes, allow_weak=True,
+                )
+                if candidate:
+                    candidate["confirmed"] = True
+                    candidate["score"] = max(candidate.get("score", 0), 5000)
+                    candidate["evidence"] = self.t("GEA SARV ID")
+                    candidates.append(candidate)
+                    direct_core_candidate = candidate
         candidates.sort(key=lambda item: item["score"], reverse=True)
+        if direct_core_candidate:
+            for item in candidates:
+                item["confirmed"] = item is direct_core_candidate
+            return candidates
+        if valid_sarv_id:
+            # A GEA sarv_id belongs exclusively to the SARV drillcore
+            # namespace. Never offer a same-numbered locality or research site
+            # when that drillcore is absent.
+            return []
         confirmed = [item for item in candidates if item["confirmed"]]
         if len(confirmed) != 1:
             for item in candidates:
@@ -3106,7 +3214,7 @@ class QeoloogPlugin:
             official_id
             and official_id == self._normalized(attributes.get("ma_orig_id"))
         )
-        explicit_match = (
+        explicit_match = source_type == "drillcore" and (
             str(attributes.get("sarv_id") or "").strip() == str(candidate_id)
         )
         distance = self._point_distance_m(
@@ -3163,9 +3271,10 @@ class QeoloogPlugin:
         display = (
             row.get("name_en") if self.language == "en" else row.get("name")
         ) or row.get("name") or row.get("number") or candidate_id
-        source_label = self.t(
-            "uuringupunkt" if source_type == "site" else "lokaliteet"
-        )
+        source_label = self.t({
+            "site": "uuringupunkt",
+            "drillcore": "puursüdamik",
+        }.get(source_type, "lokaliteet"))
         locality = row.get("locality")
         locality_id = (
             locality.get("id") if isinstance(locality, dict) else locality

@@ -1,4 +1,4 @@
-# Qeoloog 3.7.3
+# Qeoloog 3.7.4
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -70,6 +70,8 @@ Hetkel avatavat punkti tähistab kaardil kerge halo. Objektivaade sisaldab:
 
 - WFS-i üldatribuute; klikitavad on ainult `gea_id`, `kande_alus_nr` ning
   olemasolu või ühese vaste korral eraldi SARV-link;
+- GEA `sarv_id` viitab alati SARV puursüdamikule; kinnitatud SARV lingi kõrval
+  saab sama puursüdamiku avada otse Qeoloogi objektivaates;
 - geoloogilist läbilõiget EGT 2023 stratigraafilise skeemi värvidega;
 - indeksit, liitüksuse ülemist ja alumist indeksit ning litoloogiat;
 - sisse-välja lülitatavaid geoloogiliste piiride sügavussilte;
@@ -110,11 +112,13 @@ avada ja objektivaatesse laadida ilma kaardi mõõtkava muutmata. Täpsed numbri
 ja ID-vasted ning nimevasted kuvatakse enne osalisi vasteid. Kuvatakse kuni 500
 esimest vastet ning allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
 
-EGT ja SARV automaatne seos kinnitatakse ainult tugeva ning ühese tõendi korral,
-näiteks ametliku tunnuse või lähestikku asuvate samanimeliste/-numbriliste
-punktide põhjal. Ebaselged vasted kuvatakse kandidaatide loendina ega lisa
-andmeid automaatselt. Kasutaja saab kandidaadi käsitsi kinnitada; kinnitus
-salvestatakse QGIS-i kasutajaprofiili ja seda saab hiljem eemaldada.
+GEA `sarv_id` käsitletakse SARV puursüdamiku võõrvõtmena ega võrrelda sama
+numbriga lokaliteedi või uuringupunkti ID-ga. Muudel juhtudel kinnitatakse EGT
+ja SARV automaatne seos ainult tugeva ning ühese tõendi korral, näiteks ametliku
+tunnuse või lähestikku asuvate samanimeliste/-numbriliste punktide põhjal.
+Ebaselged vasted kuvatakse kandidaatide loendina ega lisa andmeid automaatselt.
+Kasutaja saab kandidaadi käsitsi kinnitada; kinnitus salvestatakse QGIS-i
+kasutajaprofiili ja seda saab hiljem eemaldada.
 
 Läbilõiget saab vertikaalselt suumida Windowsis `Ctrl` + kerimisratas ja macOS-is
 `Command` + kerimisratas. Tulba laius ei muutu. Uue objekti avamisel jääb viimati
