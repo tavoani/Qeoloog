@@ -3158,22 +3158,27 @@ class QeoloogPlugin:
             current_id = (
                 saved.get("sarv_id") if saved else sarv_id
             )
+            current_type = (
+                saved.get("source_type") if saved else "drillcore"
+            )
             details.add_sarv_match_editor(
-                current_id, manual, set_manual_drillcore,
+                current_type, current_id, manual, set_manual_sarv_object,
                 remove_manual if manual else None,
             )
 
-        def display_direct_core(core, manual, generation):
+        def display_direct_entity(
+            entity, source_type, manual, generation,
+        ):
             if (
                 token != self._detail_token
                 or generation != resolution_state["generation"]
             ):
                 return
-            if not isinstance(core, dict) or not core.get("id"):
+            if not isinstance(entity, dict) or not entity.get("id"):
                 clear_sarv()
                 return
             candidate = self._sarv_candidate(
-                core, "drillcore", attributes, allow_weak=True,
+                entity, source_type, attributes, allow_weak=True,
             )
             if not candidate:
                 clear_sarv()
@@ -3196,11 +3201,17 @@ class QeoloogPlugin:
             clear_sarv()
             render_editor()
             saved = saved_match()
-            saved_is_core = (
-                saved and saved.get("source_type") == "drillcore"
+            saved_type = (
+                saved.get("source_type") if saved else ""
+            )
+            valid_saved_type = saved_type in {
+                "drillcore", "locality", "site",
+            }
+            source_type = (
+                saved_type if valid_saved_type else "drillcore"
             )
             effective_id = str(
-                saved.get("sarv_id") if saved_is_core
+                saved.get("sarv_id") if valid_saved_type
                 else "" if saved else sarv_id
             ).strip()
             valid_id = effective_id.isdigit() and int(effective_id) > 0
@@ -3209,14 +3220,14 @@ class QeoloogPlugin:
                     isinstance(prefetched_core, dict)
                     and str(prefetched_core.get("id")) == effective_id
                 ):
-                    display_direct_core(
-                        prefetched_core, bool(saved_is_core), generation,
+                    display_direct_entity(
+                        prefetched_core, source_type, bool(saved), generation,
                     )
                     return
 
-                def direct_loaded(core):
-                    display_direct_core(
-                        core, bool(saved_is_core), generation,
+                def direct_loaded(entity):
+                    display_direct_entity(
+                        entity, source_type, bool(saved), generation,
                     )
 
                 def direct_failed(error):
@@ -3225,10 +3236,15 @@ class QeoloogPlugin:
                         and generation == resolution_state["generation"]
                     ):
                         clear_sarv()
-                        failed("SARV drill core")(error)
+                        failed("SARV")(error)
 
+                endpoint = {
+                    "drillcore": "drillcores",
+                    "locality": "localities",
+                    "site": "sites",
+                }[source_type]
                 self.network.query_sarv(
-                    f"drillcores/{effective_id}", {"expand": "*"},
+                    f"{endpoint}/{effective_id}", {"expand": "*"},
                     direct_loaded, direct_failed,
                 )
                 return
@@ -3240,40 +3256,52 @@ class QeoloogPlugin:
                 request_failed("SARV locations", clear_sarv),
             )
 
-        def set_manual_drillcore(source_id):
+        def set_manual_sarv_object(source_type, source_id):
             if not match_key:
                 return
             source_id = int(source_id)
+            source_label = self.t({
+                "locality": "lokaliteet",
+                "site": "uuringupunkt",
+            }.get(source_type, "puursüdamik"))
             self.message(
-                f"Checking SARV drill core {source_id}..."
+                f"Checking SARV {source_label} {source_id}..."
                 if self.language == "en" else
-                f"Kontrollitakse SARV puursüdamikku {source_id}..."
+                f"Kontrollitakse SARV objekti {source_label} {source_id}..."
             )
 
-            def verified(core):
+            def verified(entity):
                 if token != self._detail_token:
                     return
-                if not isinstance(core, dict) or not core.get("id"):
+                if not isinstance(entity, dict) or not entity.get("id"):
                     invalid("Invalid response")
                     return
-                persist_match("drillcore", core.get("id"))
+                persist_match(source_type, entity.get("id"))
                 self.success(
-                    f"Local SARV correction saved: drill core {core.get('id')}."
+                    f"Local SARV correction saved: {source_label} {entity.get('id')}."
                     if self.language == "en" else
-                    f"Kohalik SARV parandus salvestati: puursüdamik {core.get('id')}."
+                    f"Kohalik SARV parandus salvestati: {source_label} {entity.get('id')}."
                 )
-                refresh_resolution(core)
+                refresh_resolution(entity)
 
             def invalid(error):
                 if token == self._detail_token:
                     self.warning(
-                        f"SARV drill core {source_id} was not found; the correction was not saved."
+                        f"SARV {source_label} {source_id} was not found; the correction was not saved."
                         if self.language == "en" else
-                        f"SARV puursüdamikku {source_id} ei leitud; parandust ei salvestatud."
+                        f"SARV objekti {source_label} {source_id} ei leitud; parandust ei salvestatud."
                     )
 
+            endpoint = {
+                "drillcore": "drillcores",
+                "locality": "localities",
+                "site": "sites",
+            }.get(source_type)
+            if not endpoint:
+                invalid("Unsupported SARV object type")
+                return
             self.network.query_sarv(
-                f"drillcores/{source_id}", {"expand": "*"},
+                f"{endpoint}/{source_id}", {"expand": "*"},
                 verified, invalid,
             )
 

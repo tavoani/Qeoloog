@@ -313,7 +313,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.8.0",
+            "QGIS Qeoloog/3.8.1",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

@@ -1937,7 +1937,8 @@ class DetailWidget(QWidget):
         self.overview.setRowCount(self._overview_base_rows)
 
     def add_sarv_match_editor(
-        self, current_id, manual, edit_callback, reset_callback=None,
+        self, current_type, current_id, manual, edit_callback,
+        reset_callback=None,
     ):
         row = self.overview.rowCount()
         self.overview.insertRow(row)
@@ -1952,23 +1953,51 @@ class DetailWidget(QWidget):
                 self.plugin.t("Kohalik parandus")
                 if manual else self.plugin.t("GEA SARV ID")
             )
-            layout.addWidget(QLabel(f"{prefix}: {current_id}"))
+            type_label = self.plugin.t({
+                "locality": "lokaliteet",
+                "site": "uuringupunkt",
+            }.get(current_type, "puursüdamik"))
+            layout.addWidget(
+                QLabel(f"{prefix}: {type_label} {current_id}"),
+            )
         else:
-            layout.addWidget(QLabel(self.plugin.t("SARV puursüdamik pole seotud")))
+            layout.addWidget(QLabel(self.plugin.t("SARV objekt pole seotud")))
 
         def ask_for_id():
+            object_types = (
+                (self.plugin.t("puursüdamik"), "drillcore"),
+                (self.plugin.t("lokaliteet"), "locality"),
+                (self.plugin.t("uuringupunkt"), "site"),
+            )
+            labels = [label for label, value in object_types]
+            initial_type = next((
+                index for index, (_, value) in enumerate(object_types)
+                if value == current_type
+            ), 0)
+            type_label, accepted = QInputDialog.getItem(
+                self,
+                self.plugin.t("Määra SARV seos"),
+                self.plugin.t("SARV objekti tüüp"),
+                labels, initial_type, False,
+            )
+            if not accepted:
+                return
+            source_type = next(
+                value for label, value in object_types
+                if label == type_label
+            )
             try:
                 initial = max(1, int(current_id or 1))
             except (TypeError, ValueError):
                 initial = 1
             value, accepted = QInputDialog.getInt(
                 self,
-                self.plugin.t("Määra SARV puursüdamik"),
-                self.plugin.t("SARV puursüdamiku ID"),
+                self.plugin.t("Määra SARV seos"),
+                self.plugin.t("SARV objekti ID"),
                 initial, 1, 2147483647, 1,
             )
             if accepted:
-                edit_callback(value)
+                edit_callback(source_type, value)
 
         button = QPushButton(
             self.plugin.t("Muuda SARV seost")
