@@ -1,4 +1,4 @@
-# Qeoloog 3.4.3
+# Qeoloog 3.6.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -19,7 +19,7 @@ providers. The user interface can be displayed in Estonian or English.
 
 ## Tööriistariba
 
-Vaikimisi on ribal kuus otsenuppu:
+Vaikimisi on ribal seitse otsenuppu:
 
 | Nupp | Kiht | Teenus |
 |---|---|---|
@@ -28,6 +28,7 @@ Vaikimisi on ribal kuus otsenuppu:
 | HK | hübriidkaart | WMS |
 | PA | EGT puuraugud | WFS |
 | VP | EGT vaatluspunktid | WFS |
+| SK | SARV lokaliteedid ja uuringupunktid | SARV API |
 | AP | EGT 1:50 000 aluspõhja avamused | WMS |
 
 **LK** avab lisakihtide menüü. Seal on aluskaardid, geoloogia, uuringute ja
@@ -44,7 +45,7 @@ Hammasratta alt saab:
 - valida kogu kasutajaliidese eesti või inglise keele;
 - näidata või peita LK rippmenüüde rühmi;
 - paigutada iga kihi põhiribale, tema kindlasse kodurippmenüüsse või keelata;
-- lisada ja eemaldada WMS/WFS kihte;
+- lisada ja eemaldada WMS/WFS kihte ning SARV punktikataloogi;
 - lugeda GetCapabilities-kihiloendi;
 - muuta tähist, värvi, nime, URL-i, kihinime ja WMS-stiili;
 - lülitada sisse režiimi, kus otsenupu korduv vajutus eemaldab kihi;
@@ -66,6 +67,7 @@ Hetkel avatavat punkti tähistab kaardil kerge halo. Objektivaade sisaldab:
   olemasolu või ühese vaste korral eraldi SARV-link;
 - geoloogilist läbilõiget EGT 2023 stratigraafilise skeemi värvidega;
 - indeksit, liitüksuse ülemist ja alumist indeksit ning litoloogiat;
+- sisse-välja lülitatavaid geoloogiliste piiride sügavussilte;
 - eraldi lülitatavaid EGT kastipiire, proove ja analüüse;
 - eraldi SARV real lülitatavaid proove, analüüse ja eksemplare;
 - kattuvate SARV markerite adaptiivset koondamist ja nelja horisontaalset rada;
@@ -82,11 +84,29 @@ Puursüdamiku kastil klõpsates avaneb selle foto; mitme foto korral saab valida
 galeriimenüüst sobiva. SARV kastipiire saab läbilõikel eraldi sisse ja välja
 lülitada ning need on EGT piiridest eristatud sinise punktiiriga. EGT ja SARV
 kaste ei liideta automaatselt. SARV andmete sidumine kasutab avalikku SARV API-t
-ning ainult üheselt tuvastatud leiukoha vastet.
+ning ainult üheselt tuvastatud leiukoha vastet. SK nupp laadib eraldi
+punktikihtidena SARV lokaliteedid ja uuringupunktid. Neid saab sama
+kaardiklõpsu tööriistaga avada nagu EGT punkte.
+
+EGT ja SARV automaatne seos kinnitatakse ainult tugeva ning ühese tõendi korral,
+näiteks ametliku tunnuse või lähestikku asuvate samanimeliste/-numbriliste
+punktide põhjal. Ebaselged vasted kuvatakse kandidaatide loendina ega lisa
+andmeid automaatselt. Kasutaja saab kandidaadi käsitsi kinnitada; kinnitus
+salvestatakse QGIS-i kasutajaprofiili ja seda saab hiljem eemaldada.
 
 Läbilõiget saab vertikaalselt suumida Windowsis `Ctrl` + kerimisratas ja macOS-is
 `Command` + kerimisratas. Tulba laius ei muutu. Uue objekti avamisel jääb viimati
 valitud andmepaan avatuks.
+
+Läbilõike stratigraafia, litoloogia ja sügavused laaditakse esmalt EGT WFS-ist.
+GEA API-d kasutatakse varuallikana ainult siis, kui WFS-päring ebaõnnestub.
+Läbilõike veerud kuvatakse järjestuses sügavused, indeks, P, A, SP, SA, SE ja
+litoloogia.
+
+PA nupp on teistest tööriistariba nuppudest rõhutatud. Puuraukude ja
+vaatluspunktide kihid hoitakse uute kihtide lisamisel alati kihipuu tipus.
+Aluskorra avamuste kihile rakendatakse EGT WMS-i liiga kitsa reklaamitud
+ulatuse tõttu Saaremaa lääneosa säilitav ulatuse parandus.
 
 ## Paigaldamine
 

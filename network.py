@@ -122,6 +122,32 @@ class NetworkClient:
         url.setQuery(query)
         self.get_json(url, success, failure)
 
+    def query_sarv_all(self, resource, fields, success, failure, limit=5000):
+        """Load every page of a compact SARV public-API collection."""
+        rows = []
+        path = str(resource).strip("/")
+        url = QUrl(f"{SARV_API}/{path}/")
+        query = QUrlQuery()
+        query.addQueryItem("fields", ",".join(fields))
+        query.addQueryItem("limit", str(limit))
+        url.setQuery(query)
+
+        def load_page(target):
+            def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid SARV response")
+                    return
+                rows.extend(payload.get("results", []))
+                next_url = payload.get("next")
+                if next_url:
+                    load_page(QUrl(str(next_url)))
+                else:
+                    success(rows)
+
+            self.get_json(target, decoded, failure)
+
+        load_page(url)
+
     def query_geological_units(self, role, global_id, success, failure):
         """Load the selected object's depth intervals from EGT WFS as GeoJSON."""
         type_name = (
@@ -166,7 +192,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.4.3",
+            "QGIS Qeoloog/3.6.0",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

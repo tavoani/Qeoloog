@@ -111,6 +111,11 @@ DEFAULT_LAYERS = (
         color="#187f78", role="observations", home_group="geology", placement="toolbar",
     ),
     _layer(
+        "SK", "SARV - kohad", "SARV - locations", "SARV",
+        "https://rwapi.geoloogia.info/api/v1/public", "localities,sites",
+        color="#356f92", role="sarv_points", home_group="geology", placement="toolbar",
+    ),
+    _layer(
         "AP", "EGT - 1:50 000 aluspõhja avamused", "EGS - 1:50,000 bedrock outcrops",
         "WMS", K50, "ap_avamus_a_50t", style="ap_avamused_k50",
         color="#8a3e58", home_group="geology", placement="toolbar",
@@ -147,6 +152,7 @@ class PluginSettings:
     KEY_TOGGLE_MODE = "toggle_mode"
     KEY_LANGUAGE = "language"
     KEY_GROUPS = "groups_json"
+    KEY_SARV_MATCHES = "sarv_matches_json"
 
     @classmethod
     def load_layers(cls):
@@ -168,16 +174,27 @@ class PluginSettings:
                 merged = default.to_dict() if default else {}
                 merged.update(value)
                 if "placement" not in value:
-                    merged["placement"] = "toolbar" if value.get("code") in {"PK", "OF", "HK", "PA", "VP", "AP"} else "dropdown"
+                    merged["placement"] = (
+                        "toolbar"
+                        if value.get("code") in {"PK", "OF", "HK", "PA", "VP", "SK", "AP"}
+                        else "dropdown"
+                    )
                 layers.append(LayerDefinition.from_dict(merged))
             except (TypeError, KeyError):
                 continue
         present = {item.code for item in layers}
-        layers.extend(
-            LayerDefinition.from_dict(item.to_dict())
-            for item in DEFAULT_LAYERS
-            if item.code not in present
-        )
+        for item in DEFAULT_LAYERS:
+            if item.code in present:
+                continue
+            definition = LayerDefinition.from_dict(item.to_dict())
+            if item.code == "SK":
+                after = next((
+                    index for index, current in reversed(list(enumerate(layers)))
+                    if current.code in {"PA", "VP"}
+                ), None)
+                layers.insert(after + 1 if after is not None else len(layers), definition)
+            else:
+                layers.append(definition)
         return layers or [LayerDefinition.from_dict(item.to_dict()) for item in DEFAULT_LAYERS]
 
     @classmethod
@@ -227,4 +244,22 @@ class PluginSettings:
         QgsSettings().setValue(
             f"{cls.ORGANIZATION}/{cls.KEY_GROUPS}",
             json.dumps({group: bool(groups.get(group, True)) for group in GROUPS}),
+        )
+
+    @classmethod
+    def load_sarv_matches(cls):
+        raw = QgsSettings().value(
+            f"{cls.ORGANIZATION}/{cls.KEY_SARV_MATCHES}", "", type=str,
+        )
+        try:
+            values = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            values = {}
+        return values if isinstance(values, dict) else {}
+
+    @classmethod
+    def save_sarv_matches(cls, matches):
+        QgsSettings().setValue(
+            f"{cls.ORGANIZATION}/{cls.KEY_SARV_MATCHES}",
+            json.dumps(matches, ensure_ascii=False),
         )

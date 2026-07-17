@@ -99,7 +99,7 @@ class LayerConfigWidget(QWidget):
         form_host_layout = QVBoxLayout(form_host)
         form = QFormLayout()
         self.protocol = QComboBox()
-        self.protocol.addItems(["WMS", "WFS"])
+        self.protocol.addItems(["WMS", "WFS", "SARV"])
         self.code = QLineEdit()
         self.code.setMaxLength(4)
         self.name = QLineEdit()
@@ -258,6 +258,13 @@ class LayerConfigWidget(QWidget):
                 "Enter the service URL." if self.plugin.language == "en" else "Sisesta teenuse URL."
             )
             return
+        if self.protocol.currentText().upper() == "SARV":
+            self.plugin.message(
+                "The SARV point catalog is fixed and does not use GetCapabilities."
+                if self.plugin.language == "en"
+                else "SARV-i punktikataloog on fikseeritud ega kasuta GetCapabilities päringut."
+            )
+            return
         self.plugin.message(
             "Loading the service layer list..." if self.plugin.language == "en"
             else "Teenuse kihtide loendit laaditakse..."
@@ -306,7 +313,9 @@ class LayerConfigWidget(QWidget):
             return
         lower_name = layer_name.lower()
         role = ""
-        if lower_name.endswith(":puurauk") or lower_name == "puurauk":
+        if protocol == "SARV":
+            role = "sarv_points"
+        elif lower_name.endswith(":puurauk") or lower_name == "puurauk":
             role = "boreholes"
         elif lower_name.endswith(":vaatluspunkt") or lower_name == "vaatluspunkt":
             role = "observations"
@@ -641,6 +650,7 @@ class ProfileWidget(QWidget):
         self._click_targets = []
         self.total_depth = 0.0
         self.show_lithology = True
+        self.show_boundary_depths = True
         self.show_core_boxes = True
         self.show_sarv_core_boxes = True
         self.show_samples = True
@@ -711,12 +721,22 @@ class ProfileWidget(QWidget):
         self._update_minimum_height()
 
     def set_options(
-        self, lithology=None, core_boxes=None, samples=None, analyses=None,
-        sarv_core_boxes=None, sarv_samples=None, sarv_analyses=None, sarv_specimens=None,
+        self,
+        lithology=None,
+        boundary_depths=None,
+        core_boxes=None,
+        samples=None,
+        analyses=None,
+        sarv_core_boxes=None,
+        sarv_samples=None,
+        sarv_analyses=None,
+        sarv_specimens=None,
         sarv_grouping=None,
     ):
         if lithology is not None:
             self.show_lithology = lithology
+        if boundary_depths is not None:
+            self.show_boundary_depths = boundary_depths
         if core_boxes is not None:
             self.show_core_boxes = core_boxes
         if sarv_core_boxes is not None:
@@ -818,16 +838,36 @@ class ProfileWidget(QWidget):
             self.height() - self.TOP_MARGIN - self.BOTTOM_MARGIN,
         )
         bar_left = 68
-        sample_left = bar_left + self.BAR_WIDTH + 8
+        boundary_label_width = 64 if self.show_boundary_depths else 0
+        index_left = bar_left + self.BAR_WIDTH + boundary_label_width + 8
+        index_width = max(
+            76,
+            min(
+                140,
+                max(
+                    (
+                        painter.fontMetrics().horizontalAdvance(str(_unit_index(unit)))
+                        for unit in self.units
+                        if _unit_index(unit)
+                    ),
+                    default=66,
+                ) + 12,
+            ),
+        )
+        sample_left = index_left + index_width
         analysis_left = sample_left + 18
         sarv_sample_left = analysis_left + 20
         sarv_analysis_left = sarv_sample_left + self.SARV_TRACK_WIDTH + 8
         sarv_specimen_left = sarv_analysis_left + self.SARV_TRACK_WIDTH + 8
-        label_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 14
+        lithology_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 14
 
         def depth_y(depth):
             return self.TOP_MARGIN + draw_height * depth / max_depth
 
+        painter.setPen(QColor("#555555"))
+        painter.drawText(index_left, 34, self.plugin.t("Indeks"))
+        if self.show_lithology:
+            painter.drawText(lithology_left, 34, self.plugin.t("Litoloogia"))
         painter.setPen(QColor("#355e3b"))
         if self.show_samples:
             painter.drawText(sample_left - 1, 34, "P")
@@ -869,12 +909,17 @@ class ProfileWidget(QWidget):
             painter.fillRect(bar_left, round(y1), self.BAR_WIDTH, height, color)
             painter.setPen(QPen(QColor("#454545"), 1))
             painter.drawRect(bar_left, round(y1), self.BAR_WIDTH, height)
-            label = _unit_index(unit)
+            index = _unit_index(unit)
             lithology = unit.get("litoloogia") or unit.get("litoloogia_orig") or ""
-            if self.show_lithology and lithology:
-                label = f"{label} · {lithology}" if label else str(lithology)
-            if label and height >= 8:
-                painter.drawText(label_left, round(y1) + 12, str(label))
+            if index and height >= 8:
+                painter.drawText(index_left, round(y1) + 12, str(index))
+            if self.show_lithology and lithology and height >= 8:
+                painter.drawText(lithology_left, round(y1) + 12, str(lithology))
+
+        if self.show_boundary_depths:
+            self._draw_boundary_depth_labels(
+                painter, depth_y, max_depth, bar_left, draw_height,
+            )
 
         if self.show_core_boxes and self.core_applicable:
             hatch_color = QColor("#4f5963")
@@ -889,7 +934,7 @@ class ProfileWidget(QWidget):
                 )
             painter.setPen(QColor("#555555"))
             painter.drawText(
-                label_left, 34,
+                bar_left, 50,
                 self.plugin.t("Viirutus: puursüdamiku kast puudub"),
             )
 
@@ -969,6 +1014,53 @@ class ProfileWidget(QWidget):
                 painter, self.sarv_specimens, sarv_specimen_left, QColor("#b23a62"),
                 self.TOP_MARGIN, draw_height, max_depth, sarv=True,
             )
+
+    def _draw_boundary_depth_labels(
+        self, painter, depth_y, max_depth, bar_left, draw_height,
+    ):
+        depths = []
+        for unit in self.units:
+            for key in ("z_suht_ylemine", "z_suht_alumine"):
+                raw = unit.get(key)
+                if raw in (None, ""):
+                    continue
+                depth = _number(raw)
+                if 0 <= depth <= max_depth:
+                    depths.append(round(depth, 4))
+        depths = sorted(set(depths))
+        if not depths:
+            return
+
+        top = float(self.TOP_MARGIN)
+        bottom = top + float(draw_height)
+        targets = [float(depth_y(depth)) for depth in depths]
+        if len(targets) == 1:
+            positions = targets
+        else:
+            gap = min(12.0, (bottom - top) / (len(targets) - 1))
+            positions = [max(top, targets[0])]
+            for target in targets[1:]:
+                positions.append(max(target, positions[-1] + gap))
+            if positions[-1] > bottom:
+                positions[-1] = bottom
+                for index in range(len(positions) - 2, -1, -1):
+                    positions[index] = min(positions[index], positions[index + 1] - gap)
+
+        old_font = painter.font()
+        label_font = painter.font()
+        label_font.setPixelSize(10)
+        painter.setFont(label_font)
+        painter.setPen(QPen(QColor("#4a4a4a"), 1))
+        bar_right = bar_left + self.BAR_WIDTH
+        text_left = bar_right + 8
+        for depth, target, position in zip(depths, targets, positions):
+            target_y = round(target)
+            label_y = round(position)
+            painter.drawLine(bar_right, target_y, bar_right + 4, target_y)
+            if abs(position - target) > 1:
+                painter.drawLine(bar_right + 4, target_y, bar_right + 6, label_y)
+            painter.drawText(text_left, label_y + 4, f"{depth:g} m")
+        painter.setFont(old_font)
 
     def _draw_intervals(
         self, painter, rows, left, color, top_margin, draw_height, max_depth,
@@ -1162,11 +1254,13 @@ class DetailWidget(QWidget):
         profile_controls = QHBoxLayout()
         profile_controls.addWidget(QLabel("EGT:"))
         self.profile_lithology = QCheckBox(t("Litoloogia"))
+        self.profile_boundary_depths = QCheckBox(t("Piiride sügavused"))
         self.profile_boxes = QCheckBox(t("Kastipiirid"))
         self.profile_samples = QCheckBox(t("Proovid"))
         self.profile_analyses = QCheckBox(t("Analüüsid"))
         for checkbox in (
             self.profile_lithology,
+            self.profile_boundary_depths,
             self.profile_boxes,
             self.profile_samples,
             self.profile_analyses,
@@ -1200,6 +1294,9 @@ class DetailWidget(QWidget):
         self.tabs.addTab(profile_page, t("Läbilõige"))
         self.profile_lithology.toggled.connect(
             lambda checked: self.profile.set_options(lithology=checked)
+        )
+        self.profile_boundary_depths.toggled.connect(
+            lambda checked: self.profile.set_options(boundary_depths=checked)
         )
         self.profile_boxes.toggled.connect(
             lambda checked: self.profile.set_options(core_boxes=checked)
@@ -1265,6 +1362,7 @@ class DetailWidget(QWidget):
         self._sarv_core_images = {}
         self._egt_samples = []
         self._sarv_samples = []
+        self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
         self._sarv_specimens = []
@@ -1335,6 +1433,7 @@ class DetailWidget(QWidget):
         self._sarv_core_images = {}
         self._egt_samples = []
         self._sarv_samples = []
+        self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
         self._sarv_specimens = []
@@ -1374,6 +1473,50 @@ class DetailWidget(QWidget):
             self.overview, row, 1, display,
             f"https://geoloogia.info/locality/{locality_id}",
         )
+        self.overview.resizeColumnsToContents()
+
+    def add_match_candidates(
+        self, label, candidates, open_callback=None,
+        confirm_callback=None, remove_callback=None,
+    ):
+        for candidate in candidates:
+            row = self.overview.rowCount()
+            self.overview.insertRow(row)
+            self.overview.setItem(row, 0, QTableWidgetItem(self.plugin.t(label)))
+            host = QWidget()
+            layout = QHBoxLayout(host)
+            layout.setContentsMargins(4, 0, 4, 0)
+            text = html_escape(str(candidate.get("text") or candidate.get("id") or ""))
+            url = html_escape(str(candidate.get("url") or ""))
+            value = QLabel(f'<a href="{url}">{text}</a>' if url else text)
+            value.setOpenExternalLinks(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            layout.addWidget(value)
+            evidence = candidate.get("evidence")
+            if evidence:
+                evidence_label = QLabel(str(evidence))
+                evidence_label.setStyleSheet("color: #666666;")
+                layout.addWidget(evidence_label)
+            if open_callback:
+                button = QPushButton(self.plugin.t("Ava"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: open_callback(item)
+                )
+                layout.addWidget(button)
+            if confirm_callback and not candidate.get("confirmed"):
+                button = QPushButton(self.plugin.t("Kinnita vaste"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: confirm_callback(item)
+                )
+                layout.addWidget(button)
+            if remove_callback and candidate.get("manual"):
+                button = QPushButton(self.plugin.t("Eemalda vaste"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: remove_callback(item)
+                )
+                layout.addWidget(button)
+            layout.addStretch(1)
+            self.overview.setCellWidget(row, 1, host)
         self.overview.resizeColumnsToContents()
 
     def set_profile(self, units):
@@ -1482,10 +1625,20 @@ class DetailWidget(QWidget):
         self.profile.set_samples(rows)
         self._refresh_samples()
 
-    def set_sarv_samples(self, rows):
-        self._sarv_samples = list(rows)
+    def set_sarv_samples(self, rows, source="locality"):
+        self._sarv_samples_by_source[source] = list(rows)
+        unique = {}
+        anonymous = []
+        for values in self._sarv_samples_by_source.values():
+            for row in values:
+                row_id = row.get("id") if isinstance(row, dict) else None
+                if row_id in (None, ""):
+                    anonymous.append(row)
+                else:
+                    unique[str(row_id)] = row
+        self._sarv_samples = list(unique.values()) + anonymous
         self.profile.set_sarv_samples([
-            track for row in rows
+            track for row in self._sarv_samples
             if (track := _sarv_track(row, "sample")) is not None
         ])
         self._refresh_samples()
@@ -1654,7 +1807,10 @@ class DetailWidget(QWidget):
             QDesktopServices.openUrl(QUrl(item.text()))
 
     def _fill_pairs(self, table, attributes, role):
-        rows = [(key, value) for key, value in attributes.items() if value not in (None, "")]
+        rows = [
+            (key, value) for key, value in attributes.items()
+            if value not in (None, "") and not str(key).startswith("_qeoloog_")
+        ]
         # Dropping all rows also removes cell widgets left by the previous object.
         table.setRowCount(0)
         table.setRowCount(len(rows))
@@ -1672,7 +1828,8 @@ class DetailWidget(QWidget):
             elif key_lower == "kande_alus_nr":
                 url = f"https://fond.egt.ee/fond/egf/{display}"
             elif key_lower == "sarv_id":
-                url = f"https://geoloogia.info/locality/{display}"
+                sarv_path = "site" if role == "sarv_sites" else "locality"
+                url = f"https://geoloogia.info/{sarv_path}/{display}"
             if url:
                 self._set_link_widget(table, row_index, 1, display, url)
             else:
