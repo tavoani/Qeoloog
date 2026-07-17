@@ -1,4 +1,4 @@
-# Qeoloog 3.7.2
+# Qeoloog 3.7.3
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja

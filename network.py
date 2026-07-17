@@ -2,9 +2,8 @@
 
 import json
 from urllib.parse import quote, urlencode
-from xml.etree import ElementTree
 
-from qgis.PyQt.QtCore import QUrl, QUrlQuery
+from qgis.PyQt.QtCore import QUrl, QUrlQuery, QXmlStreamReader
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from qgis.core import QgsNetworkAccessManager
 
@@ -13,30 +12,70 @@ AUQ_REST = "https://gis.egt.ee/arcgis/rest/services/AUQ_public/AUQ_webapp_open/M
 EGT_WFS = "https://maps.egt.ee/geoserver/faktika/ows"
 GEA_API = "https://gea-api.egt.ee"
 SARV_API = "https://rwapi.geoloogia.info/api/v1/public"
-
-
-def _local_name(tag):
-    return tag.rsplit("}", 1)[-1]
+MAX_CAPABILITIES_BYTES = 20 * 1024 * 1024
 
 
 def parse_capabilities(payload, protocol):
     """Return ``(name, title)`` tuples from a WMS or WFS capabilities document."""
-    root = ElementTree.fromstring(payload)
+    if len(payload) > MAX_CAPABILITIES_BYTES:
+        raise ValueError(
+            "Capabilities XML exceeds the 20 MB safety limit."
+        )
+
+    reader = QXmlStreamReader(payload)
+    # Keep entity expansion deliberately small and reject DTD/entity tokens
+    # below. GetCapabilities documents do not need custom entities.
+    reader.setEntityExpansionLimit(1024)
     result = []
     wanted_parent = "Layer" if protocol.upper() == "WMS" else "FeatureType"
-    for element in root.iter():
-        if _local_name(element.tag) != wanted_parent:
-            continue
-        name = ""
-        title = ""
-        for child in list(element):
-            tag = _local_name(child.tag)
-            if tag == "Name" and child.text:
-                name = child.text.strip()
-            elif tag == "Title" and child.text:
-                title = child.text.strip()
-        if name:
-            result.append((name, title or name))
+    records = []
+    depth = 0
+
+    while not reader.atEnd():
+        token = reader.readNext()
+        if token in (
+            QXmlStreamReader.TokenType.DTD,
+            QXmlStreamReader.TokenType.EntityReference,
+        ):
+            raise ValueError(
+                "DTD and custom XML entities are not allowed in capabilities."
+            )
+        if token == QXmlStreamReader.TokenType.StartElement:
+            depth += 1
+            tag = str(reader.name())
+            if tag == wanted_parent:
+                records.append({"depth": depth, "name": "", "title": ""})
+            elif (
+                records
+                and depth == records[-1]["depth"] + 1
+                and tag in {"Name", "Title"}
+            ):
+                text = reader.readElementText(
+                    QXmlStreamReader.ReadElementTextBehaviour.SkipChildElements
+                ).strip()
+                records[-1][tag.casefold()] = text
+                # readElementText() leaves the reader on this element's end.
+                depth -= 1
+        elif token == QXmlStreamReader.TokenType.EndElement:
+            tag = str(reader.name())
+            if (
+                records
+                and depth == records[-1]["depth"]
+                and tag == wanted_parent
+            ):
+                record = records.pop()
+                if record["name"]:
+                    result.append((
+                        record["name"],
+                        record["title"] or record["name"],
+                    ))
+            depth = max(0, depth - 1)
+
+    if reader.hasError():
+        raise ValueError(
+            f"Invalid capabilities XML: {reader.errorString()} "
+            f"(line {reader.lineNumber()}, column {reader.columnNumber()})."
+        )
     return result
 
 
@@ -58,6 +97,7 @@ class NetworkClient:
             url,
             lambda data: success(parse_capabilities(data, protocol)),
             failure,
+            max_bytes=MAX_CAPABILITIES_BYTES,
         )
 
     def get_json(self, url, success, failure):
@@ -269,23 +309,39 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
-    def _get(self, url, success, failure):
+    def _get(self, url, success, failure, max_bytes=None):
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.7.0",
+            "QGIS Qeoloog/3.7.3",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)
+        limit_exceeded = {"value": False}
+
+        if max_bytes:
+            def enforce_size_limit(received, total):
+                if (
+                    received > max_bytes
+                    or total > max_bytes
+                ):
+                    limit_exceeded["value"] = True
+                    reply.abort()
+
+            reply.downloadProgress.connect(enforce_size_limit)
 
         def finished():
             self._replies.discard(reply)
             try:
-                if reply.error() != QNetworkReply.NetworkError.NoError:
+                if limit_exceeded["value"]:
+                    failure(
+                        "Capabilities response exceeds the 20 MB safety limit."
+                    )
+                elif reply.error() != QNetworkReply.NetworkError.NoError:
                     failure(reply.errorString())
                 else:
                     success(reply.readAll())
-            except (ValueError, ElementTree.ParseError, json.JSONDecodeError) as error:
+            except (ValueError, json.JSONDecodeError) as error:
                 failure(str(error))
             finally:
                 reply.deleteLater()
