@@ -77,6 +77,55 @@ class NetworkClient:
         url.setQuery(query)
         self.get_json(url, success, failure)
 
+    def query_auq_all(
+        self, table_id, where, fields, success, failure, order_by="objectid",
+        page_size=2000,
+    ):
+        """Load every page of an ArcGIS table query."""
+        rows = []
+
+        def load_page(offset):
+            url = QUrl(f"{AUQ_REST}/{table_id}/query")
+            query = QUrlQuery()
+            for key, value in (
+                ("f", "json"),
+                ("where", where),
+                ("outFields", ",".join(fields) if fields else "*"),
+                ("returnGeometry", "false"),
+                ("resultOffset", str(offset)),
+                ("resultRecordCount", str(page_size)),
+            ):
+                query.addQueryItem(key, value)
+            if order_by:
+                query.addQueryItem("orderByFields", order_by)
+            url.setQuery(query)
+
+            def decoded(payload):
+                if payload.get("error"):
+                    failure(payload["error"].get("message", "AUQ query failed"))
+                    return
+                page = [
+                    feature.get("attributes", {})
+                    for feature in payload.get("features", [])
+                ]
+                rows.extend(page)
+                if len(page) >= page_size or payload.get("exceededTransferLimit"):
+                    load_page(offset + len(page))
+                else:
+                    success(rows)
+
+            self.get_json(url, decoded, failure)
+
+        load_page(0)
+
+    def query_auq_metadata(self, table_id, success, failure):
+        """Load ArcGIS layer/table metadata, including coded-value domains."""
+        url = QUrl(f"{AUQ_REST}/{table_id}")
+        query = QUrlQuery()
+        query.addQueryItem("f", "json")
+        url.setQuery(query)
+        self.get_json(url, success, failure)
+
     def query_auq_parent_ids(self, table_id, success, failure):
         """Return object UUIDs which have rows in an AUQ related table."""
         statistics = json.dumps(
@@ -148,6 +197,38 @@ class NetworkClient:
 
         load_page(url)
 
+    def query_sarv_pages(
+        self, resource, parameters, fields, success, failure, limit=5000,
+    ):
+        """Load all pages of a filtered SARV collection."""
+        rows = []
+        path = str(resource).strip("/")
+        url = QUrl(f"{SARV_API}/{path}/")
+        query = QUrlQuery()
+        for key, value in parameters.items():
+            if value not in (None, "", []):
+                query.addQueryItem(key, str(value))
+        if fields:
+            query.addQueryItem("fields", ",".join(fields))
+        query.addQueryItem("limit", str(limit))
+        url.setQuery(query)
+
+        def load_page(target):
+            def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid SARV response")
+                    return
+                rows.extend(payload.get("results", []))
+                next_url = payload.get("next")
+                if next_url:
+                    load_page(QUrl(str(next_url)))
+                else:
+                    success(rows)
+
+            self.get_json(target, decoded, failure)
+
+        load_page(url)
+
     def query_geological_units(self, role, global_id, success, failure):
         """Load the selected object's depth intervals from EGT WFS as GeoJSON."""
         type_name = (
@@ -192,7 +273,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.6.1",
+            "QGIS Qeoloog/3.7.0",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

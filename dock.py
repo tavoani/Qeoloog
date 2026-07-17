@@ -5,8 +5,8 @@ from html import escape as html_escape
 from math import floor, log10
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import QSize, Qt, QUrl
-from qgis.PyQt.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPen
+from qgis.PyQt.QtCore import QSize, Qt, QUrl, pyqtSignal
+from qgis.PyQt.QtGui import QAction, QBrush, QColor, QDesktopServices, QPainter, QPen
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -27,12 +27,73 @@ from qgis.PyQt.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .i18n import field_label
 from .models import GROUPS, LayerDefinition
+
+
+class MultiSelectButton(QToolButton):
+    """Compact checkable multi-select; no checks means All."""
+
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, all_text, parent=None):
+        super().__init__(parent)
+        self.all_text = all_text
+        self._actions = {}
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.setMenu(QMenu(self))
+        self._update_text()
+
+    def set_options(self, options):
+        selected = self.selected_values()
+        self.menu().clear()
+        self._actions = {}
+        for value, label in options:
+            action = QAction(str(label), self.menu())
+            action.setCheckable(True)
+            action.setData(str(value))
+            action.setChecked(str(value) in selected)
+            action.toggled.connect(self._changed)
+            self.menu().addAction(action)
+            self._actions[str(value)] = action
+        self._update_text()
+
+    def selected_values(self):
+        return {
+            value for value, action in self._actions.items()
+            if action.isChecked()
+        }
+
+    def clear_selection(self):
+        for action in self._actions.values():
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _changed(self):
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _update_text(self):
+        selected = [
+            action.text() for action in self._actions.values()
+            if action.isChecked()
+        ]
+        if not selected:
+            text = self.all_text
+        elif len(selected) <= 2:
+            text = ", ".join(selected)
+        else:
+            text = f"{len(selected)}"
+        self.setText(text)
+        self.setToolTip(", ".join(selected) if selected else self.all_text)
 
 
 class LayerConfigWidget(QWidget):
@@ -417,6 +478,35 @@ class FilterWidget(QWidget):
             related_layout.addRow(t(title), choice)
         layout.addWidget(related_group)
 
+        sample_group = QGroupBox(t("Proovide filtrid"))
+        sample_layout = QFormLayout(sample_group)
+        self.sample_filters = {}
+        for field, title in (
+            ("proov_tyyp", "Proovi tüüp"),
+            ("eesmark", "Proovi eesmärk"),
+            ("staatus", "Proovi staatus"),
+        ):
+            choice = MultiSelectButton(t("Kõik"))
+            choice.selectionChanged.connect(self._changed)
+            self.sample_filters[field] = choice
+            sample_layout.addRow(t(title), choice)
+        layout.addWidget(sample_group)
+
+        analysis_group = QGroupBox(t("Analüüside filtrid"))
+        analysis_layout = QFormLayout(analysis_group)
+        self.analysis_filters = {}
+        for table_id, field, title in (
+            (3, "analyys_meetod", "Analüüsi meetod"),
+            (3, "labor", "Analüüsi labor"),
+            (4, "analyys_tulem_tyyp", "Tulemuse tüüp"),
+            (4, "analyys_naitaja", "Analüüsi näitaja"),
+        ):
+            choice = MultiSelectButton(t("Kõik"))
+            choice.selectionChanged.connect(self._changed)
+            self.analysis_filters[(table_id, field)] = choice
+            analysis_layout.addRow(t(title), choice)
+        layout.addWidget(analysis_group)
+
         self.identify_button = QPushButton(t("Klõpsa objektil ja ava andmed"))
         self.identify_button.setCheckable(True)
         self.identify_button.toggled.connect(self.plugin.set_identify_active)
@@ -436,6 +526,7 @@ class FilterWidget(QWidget):
         self.observations.stateChanged.connect(self._changed)
         for checkbox in self.categories.values():
             checkbox.stateChanged.connect(self._changed)
+        self.reload_domain_options()
 
     def _changed(self):
         self.plugin.apply_egt_filters()
@@ -446,10 +537,303 @@ class FilterWidget(QWidget):
     def related_requirements(self):
         return {key: choice.currentData() for key, choice in self.related.items()}
 
+    def egt_domain_requirements(self):
+        return {
+            "samples": {
+                field: choice.selected_values()
+                for field, choice in self.sample_filters.items()
+            },
+            "analyses": {
+                key: choice.selected_values()
+                for key, choice in self.analysis_filters.items()
+            },
+        }
+
+    def reload_domain_options(self):
+        for field, choice in self.sample_filters.items():
+            choice.set_options(self.plugin.egt_options(18, field))
+        for (table_id, field), choice in self.analysis_filters.items():
+            choice.set_options(self.plugin.egt_options(table_id, field))
+
     def set_identify_checked(self, checked):
         self.identify_button.blockSignals(True)
         self.identify_button.setChecked(checked)
         self.identify_button.blockSignals(False)
+
+
+class SarvFilterWidget(QWidget):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        t = plugin.t
+        layout = QVBoxLayout(self)
+
+        kinds = QGroupBox(t("Objekti liigid"))
+        kinds_layout = QVBoxLayout(kinds)
+        self.kinds = {}
+        for role, title in (
+            ("sarv_localities", "Lokaliteedid"),
+            ("sarv_sites", "Uuringupunktid"),
+            ("sarv_drillcores", "Puursüdamikud"),
+        ):
+            checkbox = QCheckBox(t(title))
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._changed)
+            self.kinds[role] = checkbox
+            kinds_layout.addWidget(checkbox)
+        layout.addWidget(kinds)
+
+        extent_group = QGroupBox(t("Asukoht ja sügavus"))
+        extent_layout = QFormLayout(extent_group)
+        self.current_extent = QCheckBox(t("Ainult kaardi praegune ulatus"))
+        self.current_extent.toggled.connect(self._changed)
+        extent_layout.addRow(self.current_extent)
+        self.depth_min = QLineEdit()
+        self.depth_max = QLineEdit()
+        self.depth_min.setPlaceholderText("0")
+        self.depth_max.setPlaceholderText("m")
+        self.depth_min.editingFinished.connect(self._changed)
+        self.depth_max.editingFinished.connect(self._changed)
+        extent_layout.addRow(t("Min sügavus"), self.depth_min)
+        extent_layout.addRow(t("Max sügavus"), self.depth_max)
+        layout.addWidget(extent_group)
+
+        related_group = QGroupBox(t("Seotud andmed"))
+        related_layout = QFormLayout(related_group)
+        self.related = {}
+        for key, title in (
+            ("core", "Puursüdamik olemas"),
+            ("samples", "Proovid olemas"),
+            ("analyses", "Analüüsid olemas"),
+            ("specimens", "Eksemplarid olemas"),
+        ):
+            choice = QComboBox()
+            choice.addItem(t("Kõik"), "any")
+            choice.addItem(t("Jah"), "yes")
+            choice.addItem(t("Ei"), "no")
+            choice.currentIndexChanged.connect(self._changed)
+            self.related[key] = choice
+            related_layout.addRow(t(title), choice)
+        layout.addWidget(related_group)
+
+        sample_group = QGroupBox(t("Proovide filtrid"))
+        sample_layout = QFormLayout(sample_group)
+        self.sample_purpose = MultiSelectButton(t("Kõik"))
+        self.sample_type = MultiSelectButton(t("Kõik"))
+        self.sample_purpose.set_options(plugin.sarv_purpose_options())
+        self.sample_purpose.selectionChanged.connect(self._changed)
+        self.sample_type.selectionChanged.connect(self._changed)
+        sample_layout.addRow(t("Proovi eesmärk"), self.sample_purpose)
+        sample_layout.addRow(t("Proovi tüüp"), self.sample_type)
+        layout.addWidget(sample_group)
+
+        analysis_group = QGroupBox(t("Analüüside filtrid"))
+        analysis_layout = QFormLayout(analysis_group)
+        self.analysis_method = MultiSelectButton(t("Kõik"))
+        self.analysis_method.selectionChanged.connect(self._changed)
+        analysis_layout.addRow(t("Analüüsi meetod"), self.analysis_method)
+        layout.addWidget(analysis_group)
+
+        note = QLabel(
+            t("SARV seotud andmete filtrid päritakse vajadusel serverist. "
+              "Tühi valik tähendab kõiki väärtusi.")
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        self.reload_options()
+
+    def reload_options(self):
+        self.analysis_method.set_options(self.plugin.sarv_analysis_options)
+        self.sample_type.set_options(self.plugin.sarv_sample_type_options)
+
+    def requirements(self):
+        def number(widget):
+            try:
+                return float(widget.text().strip()) if widget.text().strip() else None
+            except ValueError:
+                return None
+
+        return {
+            "kinds": {
+                role for role, checkbox in self.kinds.items()
+                if checkbox.isChecked()
+            },
+            "current_extent": self.current_extent.isChecked(),
+            "depth_min": number(self.depth_min),
+            "depth_max": number(self.depth_max),
+            "related": {
+                key: choice.currentData() for key, choice in self.related.items()
+            },
+            "sample_purpose": self.sample_purpose.selected_values(),
+            "sample_type": self.sample_type.selected_values(),
+            "analysis_method": self.analysis_method.selected_values(),
+        }
+
+    def _changed(self):
+        self.plugin.apply_sarv_filters()
+
+
+class SearchWidget(QWidget):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        t = plugin.t
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source = QComboBox()
+        self.source.addItem(t("EGT ja SARV"), "both")
+        self.source.addItem("EGT", "egt")
+        self.source.addItem("SARV", "sarv")
+        form.addRow(t("Allikas"), self.source)
+        kind_host = QWidget()
+        kind_layout = QHBoxLayout(kind_host)
+        kind_layout.setContentsMargins(0, 0, 0, 0)
+        self.kinds = {}
+        for role, label in (
+            ("boreholes", "PA"),
+            ("observations", "VP"),
+            ("sarv_localities", "SL"),
+            ("sarv_sites", "SU"),
+            ("sarv_drillcores", "SK"),
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.setToolTip(t({
+                "boreholes": "Puuraugud",
+                "observations": "Vaatluspunktid",
+                "sarv_localities": "Lokaliteedid",
+                "sarv_sites": "Uuringupunktid",
+                "sarv_drillcores": "Puursüdamikud",
+            }[role]))
+            self.kinds[role] = checkbox
+            kind_layout.addWidget(checkbox)
+        form.addRow(t("Objekti liigid"), kind_host)
+        self.text = QLineEdit()
+        self.text.setPlaceholderText(t("Nimi, number või ID"))
+        self.text.returnPressed.connect(self.run)
+        form.addRow(t("Otsing"), self.text)
+        self.current_extent = QCheckBox(t("Ainult kaardi praegune ulatus"))
+        form.addRow(self.current_extent)
+        depth_host = QWidget()
+        depth_layout = QHBoxLayout(depth_host)
+        depth_layout.setContentsMargins(0, 0, 0, 0)
+        self.depth_min = QLineEdit()
+        self.depth_max = QLineEdit()
+        self.depth_min.setPlaceholderText(t("Min"))
+        self.depth_max.setPlaceholderText(t("Max"))
+        depth_layout.addWidget(self.depth_min)
+        depth_layout.addWidget(self.depth_max)
+        form.addRow(t("Sügavus"), depth_host)
+        self.sample_type = MultiSelectButton(t("Kõik"))
+        self.sample_purpose = MultiSelectButton(t("Kõik"))
+        self.analysis_method = MultiSelectButton(t("Kõik"))
+        self.related = {}
+        related_host = QWidget()
+        related_layout = QHBoxLayout(related_host)
+        related_layout.setContentsMargins(0, 0, 0, 0)
+        for key, label in (
+            ("core", "Puursüdamik"),
+            ("samples", "Proovid"),
+            ("analyses", "Analüüsid"),
+        ):
+            choice = QComboBox()
+            choice.addItem(f"{t(label)}: {t('Kõik')}", "any")
+            choice.addItem(f"{t(label)}: {t('Jah')}", "yes")
+            choice.addItem(f"{t(label)}: {t('Ei')}", "no")
+            choice.setToolTip(t(label))
+            self.related[key] = choice
+            related_layout.addWidget(choice)
+        form.addRow(t("Seotud andmed"), related_host)
+        form.addRow(t("Proovi tüüp"), self.sample_type)
+        form.addRow(t("Proovi eesmärk"), self.sample_purpose)
+        form.addRow(t("Analüüsi meetod"), self.analysis_method)
+        layout.addLayout(form)
+        self.search_button = QPushButton(t("Otsi"))
+        self.search_button.clicked.connect(self.run)
+        layout.addWidget(self.search_button)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.results = QTableWidget(0, 6)
+        self.results.setHorizontalHeaderLabels(
+            (t("Allikas"), t("Tüüp"), t("Nimi"), t("ID"),
+             t("Sügavus"), t("Toiming"))
+        )
+        self.results.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        layout.addWidget(self.results)
+        self.reload_domain_options()
+
+    def reload_domain_options(self):
+        egt_types = self.plugin.egt_options(18, "proov_tyyp")
+        egt_purposes = self.plugin.egt_options(18, "eesmark")
+        self.sample_type.set_options(
+            [(f"egt:{code}", f"EGT · {name}") for code, name in egt_types]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_sample_type_options]
+        )
+        self.sample_purpose.set_options(
+            [(f"egt:{code}", f"EGT · {name}") for code, name in egt_purposes]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_purpose_options()]
+        )
+        self.analysis_method.set_options(
+            [(f"egt:{code}", f"EGT · {name}")
+             for code, name in self.plugin.egt_options(3, "analyys_meetod")]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_analysis_options]
+        )
+
+    def criteria(self):
+        def number(widget):
+            try:
+                return float(widget.text().strip()) if widget.text().strip() else None
+            except ValueError:
+                return None
+
+        return {
+            "source": self.source.currentData(),
+            "kinds": {
+                role for role, checkbox in self.kinds.items()
+                if checkbox.isChecked()
+            },
+            "text": self.text.text().strip(),
+            "current_extent": self.current_extent.isChecked(),
+            "depth_min": number(self.depth_min),
+            "depth_max": number(self.depth_max),
+            "sample_type": self.sample_type.selected_values(),
+            "sample_purpose": self.sample_purpose.selected_values(),
+            "analysis_method": self.analysis_method.selected_values(),
+            "related": {
+                key: choice.currentData() for key, choice in self.related.items()
+            },
+        }
+
+    def run(self):
+        self.search_button.setEnabled(False)
+        self.status.setText(self.plugin.t("Otsitakse…"))
+        self.plugin.run_search(self.criteria(), self.set_results)
+
+    def set_results(self, rows, message=""):
+        self.search_button.setEnabled(True)
+        self.status.setText(message or f"{len(rows)} {self.plugin.t('tulemust')}")
+        self.results.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column, key in enumerate(
+                ("source", "type", "name", "id", "depth")
+            ):
+                self.results.setItem(
+                    row_index, column,
+                    QTableWidgetItem(_display_value(row.get(key))),
+                )
+            button = QPushButton(self.plugin.t("Ava"))
+            button.clicked.connect(
+                lambda checked=False, item=row: self.plugin.open_search_result(item)
+            )
+            self.results.setCellWidget(row_index, 5, button)
+        self.results.resizeColumnsToContents()
 
 
 class _LegacyProfileWidget(QWidget):
@@ -1653,11 +2037,11 @@ class DetailWidget(QWidget):
                 (
                     "EGT",
                     row.get("proov_tahis_alg"),
-                    row.get("proov_tyyp"),
+                    self.plugin.decode_egt(18, "proov_tyyp", row.get("proov_tyyp")),
                     row.get("z_suht_ylemine"),
                     row.get("z_suht_alumine"),
-                    row.get("eesmark"),
-                    row.get("staatus"),
+                    self.plugin.decode_egt(18, "eesmark", row.get("eesmark")),
+                    self.plugin.decode_egt(18, "staatus", row.get("staatus")),
                 )
                 for row in self._egt_samples
             )
@@ -1707,12 +2091,18 @@ class DetailWidget(QWidget):
             for row in egt_rows:
                 results = results_by_analysis.get(row.get("globalid"), [])
                 indicators = ", ".join(
-                    _analysis_result(item, self.plugin.t("Näitaja")) for item in results[:8]
+                    _analysis_result(
+                        item, self.plugin.t("Näitaja"), self.plugin
+                    ) for item in results[:8]
                 )
                 values.append((
                     "EGT", row.get("analyys_kood"), _egt_depth_text(row),
                     _date_value(row.get("kuupaev")),
-                    row.get("analyys_meetod"), row.get("labor"), indicators,
+                    self.plugin.decode_egt(
+                        3, "analyys_meetod", row.get("analyys_meetod")
+                    ),
+                    self.plugin.decode_egt(3, "labor", row.get("labor")),
+                    indicators,
                 ))
         sarv_rows = sum(self._sarv_analyses_by_source.values(), [])
         if self.analysis_sources["SARV"].isChecked():
@@ -1732,6 +2122,11 @@ class DetailWidget(QWidget):
         self.tabs.setTabText(
             4, f"{self.plugin.t('Analüüsid')} ({len(egt_rows) + len(sarv_rows)})"
         )
+
+    def refresh_decoded_values(self):
+        """Refresh already-open tables after asynchronous domains arrive."""
+        self._refresh_samples()
+        self._refresh_analyses()
 
     def set_sarv_specimens(self, rows):
         self._sarv_specimens = list(rows)
@@ -1881,11 +2276,25 @@ class QeoloogDock(QDockWidget):
         self.tabs = QTabWidget()
         self.layers = LayerConfigWidget(plugin)
         self.filters = FilterWidget(plugin)
+        self.sarv_filters = SarvFilterWidget(plugin)
+        self.search = SearchWidget(plugin)
         self.details = DetailWidget(plugin)
         self.tabs.addTab(self.layers, plugin.t("Kihid"))
-        self.tabs.addTab(self.filters, plugin.t("EGT filtrid"))
+        self.filter_page = self._scroll(self.filters)
+        self.sarv_filter_page = self._scroll(self.sarv_filters)
+        self.search_page = self._scroll(self.search)
+        self.tabs.addTab(self.filter_page, plugin.t("EGT filtrid"))
+        self.tabs.addTab(self.sarv_filter_page, plugin.t("SARV filtrid"))
+        self.tabs.addTab(self.search_page, plugin.t("Otsing"))
         self.tabs.addTab(self.details, plugin.t("Objekti andmed"))
         self.setWidget(self.tabs)
+
+    @staticmethod
+    def _scroll(widget):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
+        return scroll
 
     def show_details(self):
         self.tabs.setCurrentWidget(self.details)
@@ -2034,11 +2443,26 @@ def _display_value(value):
     return str(value)
 
 
-def _analysis_result(item, fallback="Näitaja"):
+def _analysis_result(item, fallback="Näitaja", plugin=None):
     indicator = item.get("analyys_naitaja") or fallback
     value = item.get("tulem")
     unit = item.get("yhik") or ""
-    return f"{indicator}: {_display_value(value)} {unit}".strip()
+    prefix = item.get("erimark") or ""
+    if plugin:
+        indicator = plugin.decode_egt(4, "analyys_naitaja", indicator)
+        unit = plugin.decode_egt(4, "yhik", unit)
+        prefix = plugin.decode_egt(4, "erimark", prefix)
+    result_type = item.get("analyys_tulem_tyyp")
+    type_text = (
+        plugin.decode_egt(4, "analyys_tulem_tyyp", result_type)
+        if plugin and result_type not in (None, "") else ""
+    )
+    measured = " ".join(
+        part for part in (str(prefix).strip(), _display_value(value), str(unit).strip())
+        if part
+    )
+    label = f"{indicator}: {measured}".strip()
+    return f"{label} ({type_text})" if type_text else label
 
 
 def _nice_depth_step(max_depth, draw_height):

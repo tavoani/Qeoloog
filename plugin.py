@@ -17,6 +17,7 @@ from qgis.core import (
     QgsFeature,
     QgsFeatureRequest,
     QgsField,
+    QgsExpressionContextUtils,
     QgsGeometry,
     QgsMarkerSymbol,
     QgsPalLayerSettings,
@@ -49,6 +50,25 @@ class QeoloogPlugin:
     ROLE_PROPERTY = "qeoloog/role"
     LEGACY_ROLE_PROPERTY = "eesti_wms_nupud/role"
     CATEGORY_COLORS = {1: "#d7bd72", 2: "#7796c6", 3: "#b56b6b", 997: "#8f8f8f"}
+    SARV_SAMPLE_PURPOSES = {
+        0: ("määratlemata", "unspecified"),
+        1: ("happeresistentsed mikrofossiilid", "acid-resistant microfossils"),
+        2: ("karbonaatsed mikrofossiilid", "carbonate microfossils"),
+        3: ("makrofossiilid", "macrofossils"),
+        4: ("litoloogia", "lithology"),
+        5: ("geokeemia", "geochemistry"),
+        6: ("mineraloogia", "mineralogy"),
+        7: ("kombineeritud", "combined"),
+        8: ("mulla geokeemia", "soil geochemistry"),
+        9: ("geokeemia ja petrofüüsika", "geochemistry and petrophysics"),
+        10: ("stabiilsed isotoobid", "stable isotopes"),
+        11: ("geokeemia ja mineraloogia", "geochemistry and mineralogy"),
+        12: ("põhjavee geokeemia", "groundwater geochemistry"),
+        13: ("mikrofossiilid", "microfossils"),
+        14: ("geotehnika", "geotechnics"),
+        15: ("mikropaleontoloogia ja geokeemia", "micropaleontology and geochemistry"),
+        16: ("ehitusmaterjali uuringud", "building material testing"),
+    }
     AK_CORRECTED_EXTENT = QgsRectangle(369548.1875, 6380032.5, 739208.1875, 6653113.0)
 
     def __init__(self, iface):
@@ -79,13 +99,137 @@ class QeoloogPlugin:
         self._detail_warning_token = None
         self.related_index = {}
         self.related_index_loading = False
+        self.egt_domains = {}
+        self.egt_domain_options = {}
+        self.egt_filter_rows = {"samples": [], "analyses": []}
+        self._egt_catalog_loading = False
+        self._egt_result_filter_cache = {}
+        self._egt_result_filter_loading = set()
         self._sarv_points_loading = False
         self._sarv_point_cache = None
         self._sarv_point_waiters = []
+        self.sarv_analysis_options = []
+        self.sarv_sample_type_options = []
+        self._sarv_filter_generation = 0
         self.sarv_matches = PluginSettings.load_sarv_matches()
 
     def t(self, text):
         return translate(text, self.language)
+
+    def decode_egt(self, table_id, field, value):
+        """Return an official EGT domain label while preserving unknown values."""
+        if value in (None, ""):
+            return ""
+        return self.egt_domains.get(
+            (int(table_id), str(field)), {}
+        ).get(str(value), str(value))
+
+    def egt_options(self, table_id, field):
+        return list(self.egt_domain_options.get((int(table_id), str(field)), []))
+
+    def sarv_purpose_options(self):
+        language_index = 1 if self.language == "en" else 0
+        return [
+            (str(code), labels[language_index])
+            for code, labels in self.SARV_SAMPLE_PURPOSES.items()
+        ]
+
+    def _load_egt_domains(self):
+        """Load official coded-value domains used by details and filters."""
+        pending = {18, 3, 4}
+
+        def parse_domain(domain):
+            values = {}
+            if not isinstance(domain, dict):
+                return values
+            for item in domain.get("codedValues", []):
+                code = item.get("code")
+                name = item.get("name")
+                if code not in (None, "") and name not in (None, ""):
+                    values[str(code)] = str(name)
+            return values
+
+        def loaded(table_id):
+            def handler(payload):
+                found = {}
+                for field in payload.get("fields", []):
+                    values = parse_domain(field.get("domain"))
+                    if values:
+                        found.setdefault(field.get("name"), {}).update(values)
+                for subtype in payload.get("types", []):
+                    for field_name, domain in (subtype.get("domains") or {}).items():
+                        values = parse_domain(domain)
+                        if values:
+                            found.setdefault(field_name, {}).update(values)
+                for field_name, values in found.items():
+                    key = (table_id, field_name)
+                    self.egt_domains[key] = values
+                    self.egt_domain_options[key] = sorted(
+                        values.items(), key=lambda item: item[1].casefold()
+                    )
+                pending.discard(table_id)
+                if not pending and self.dock:
+                    self.dock.filters.reload_domain_options()
+                    self.dock.search.reload_domain_options()
+                    self.dock.details.refresh_decoded_values()
+            return handler
+
+        def failed(table_id):
+            def handler(error):
+                pending.discard(table_id)
+                self.warning(
+                    (f"Could not load EGT code descriptions (table {table_id}): {error}"
+                     if self.language == "en" else
+                     f"EGT koodikirjelduste laadimine ebaõnnestus (tabel {table_id}): {error}")
+                )
+            return handler
+
+        for table_id in tuple(pending):
+            self.network.query_auq_metadata(
+                table_id, loaded(table_id), failed(table_id)
+            )
+
+    def _load_sarv_filter_options(self):
+        def refresh():
+            if self.dock:
+                self.dock.sarv_filters.reload_options()
+                self.dock.search.reload_domain_options()
+
+        def methods_loaded(rows):
+            options = []
+            for row in rows:
+                identifier = row.get("id")
+                if identifier in (None, ""):
+                    continue
+                label = (
+                    row.get("name_en") if self.language == "en"
+                    else row.get("name")
+                ) or row.get("name") or identifier
+                options.append((str(identifier), str(label)))
+            self.sarv_analysis_options = sorted(
+                options, key=lambda item: item[1].casefold()
+            )
+            refresh()
+
+        def types_loaded(rows):
+            values = sorted({
+                str(row.get("type")).strip()
+                for row in rows if row.get("type") not in (None, "")
+            }, key=str.casefold)
+            self.sarv_sample_type_options = [(value, value) for value in values]
+            refresh()
+
+        def ignored(error):
+            return None
+
+        self.network.query_sarv_all(
+            "analysis-methods", ("id", "name", "name_en"),
+            methods_loaded, ignored, limit=1000,
+        )
+        self.network.query_sarv_pages(
+            "samples", {"type__isnull": "false"}, ("id", "type"),
+            types_loaded, ignored, limit=5000,
+        )
 
     def display_name(self, definition):
         if self.language == "en" and definition.name_en:
@@ -104,6 +248,8 @@ class QeoloogPlugin:
         project.layersAdded.connect(self._project_layers_changed)
         project.layersRemoved.connect(self._project_layers_changed)
         self._build_actions()
+        self._load_egt_domains()
+        self._load_sarv_filter_options()
         QTimer.singleShot(0, self._refresh_loaded_plugin_layers)
         QTimer.singleShot(0, self.apply_egt_filters)
 
@@ -701,6 +847,7 @@ class QeoloogPlugin:
                 f"{layers[2].featureCount()} puursüdamikku."
             )
         )
+        self.apply_sarv_filters()
         self.sync_dropdown_checks()
 
     def _remove_layers_and_empty_groups(self, layer_ids):
@@ -885,6 +1032,10 @@ class QeoloogPlugin:
             root.reorderGroupLayers(ordered)
 
     def _apply_category_renderer(self, layer, related_expression=""):
+        QgsExpressionContextUtils.setLayerVariable(
+            layer, "qeoloog_filter_expression",
+            related_expression or "TRUE",
+        )
         labels = {1: "Pinnakate", 2: "Aluspõhi", 3: "Aluskord", 997: "Muu / teadmata"}
         root_rule = QgsRuleBasedRenderer.Rule(None)
         for code in (1, 2, 3, 997):
@@ -897,7 +1048,12 @@ class QeoloogPlugin:
             )
             expression = category_expression
             if related_expression:
-                expression = f"({category_expression}) AND ({related_expression})"
+                # eval(layer-variable) deliberately prevents WFS from expanding
+                # large ID lists into a request URL; QGIS evaluates it locally.
+                expression = (
+                    f"({category_expression}) AND "
+                    "eval(@qeoloog_filter_expression)"
+                )
             rule = QgsRuleBasedRenderer.Rule(symbol)
             rule.setLabel(self.t(labels[code]))
             rule.setFilterExpression(expression)
@@ -943,6 +1099,24 @@ class QeoloogPlugin:
                 related_expression = " AND ".join(
                     f"({item})" for item in self._related_subset(requirements)
                 )
+        domain_requirements = self.dock.filters.egt_domain_requirements()
+        if any(
+            selected
+            for groups in domain_requirements.values()
+            for selected in groups.values()
+        ):
+            if not all(self.egt_filter_rows.values()):
+                self._ensure_egt_filter_catalog()
+            else:
+                domain_clauses = self._egt_domain_filter_clauses(
+                    domain_requirements
+                )
+                if domain_clauses is not None:
+                    combined = [related_expression] if related_expression else []
+                    combined.extend(domain_clauses)
+                    related_expression = " AND ".join(
+                        f"({clause})" for clause in combined if clause
+                    )
         visibility = {
             "boreholes": self.dock.filters.boreholes.isChecked(),
             "observations": self.dock.filters.observations.isChecked(),
@@ -958,6 +1132,148 @@ class QeoloogPlugin:
                 if node:
                     node.setItemVisibilityChecked(visible)
                 layer.triggerRepaint()
+
+    def _ensure_egt_filter_catalog(self):
+        if self._egt_catalog_loading:
+            return
+        self._egt_catalog_loading = True
+        pending = {"samples", "analyses"}
+
+        def loaded(key):
+            def handler(rows):
+                self.egt_filter_rows[key] = list(rows)
+                pending.discard(key)
+                if not pending:
+                    self._egt_catalog_loading = False
+                    self.apply_egt_filters()
+            return handler
+
+        def failed(key):
+            def handler(error):
+                pending.discard(key)
+                self._egt_catalog_loading = False
+                self.warning(
+                    (f"Could not load EGT {key} filter data: {error}"
+                     if self.language == "en" else
+                     f"EGT filtriandmete {key} laadimine ebaõnnestus: {error}")
+                )
+            return handler
+
+        self.network.query_auq_all(
+            18, "puurauk_vaatluspunkt_id IS NOT NULL",
+            (
+                "objectid", "puurauk_vaatluspunkt_id", "proov_tyyp",
+                "eesmark", "staatus",
+            ),
+            loaded("samples"), failed("samples"),
+        )
+        self.network.query_auq_all(
+            3, "puurauk_vaatluspunkt_id IS NOT NULL",
+            (
+                "objectid", "globalid", "puurauk_vaatluspunkt_id",
+                "analyys_meetod", "labor",
+            ),
+            loaded("analyses"), failed("analyses"),
+        )
+
+    @staticmethod
+    def _row_matches_domains(row, selections):
+        for field, selected in selections.items():
+            if selected and str(row.get(field)) not in selected:
+                return False
+        return True
+
+    @staticmethod
+    def _id_membership_clause(values):
+        values = sorted({str(value).upper() for value in values if value})
+        if not values:
+            return '"esri_globalid" = \'__none__\''
+        quoted = ", ".join(
+            f"'{value.replace(chr(39), chr(39) * 2)}'" for value in values
+        )
+        return f'"esri_globalid" IN ({quoted})'
+
+    def _egt_domain_filter_clauses(self, requirements):
+        clauses = []
+        sample_filters = requirements["samples"]
+        if any(sample_filters.values()):
+            parents = {
+                row.get("puurauk_vaatluspunkt_id")
+                for row in self.egt_filter_rows["samples"]
+                if self._row_matches_domains(row, sample_filters)
+            }
+            clauses.append(self._id_membership_clause(parents))
+
+        analysis_filters = requirements["analyses"]
+        direct = {
+            field: selected
+            for (table_id, field), selected in analysis_filters.items()
+            if table_id == 3
+        }
+        result = {
+            field: selected
+            for (table_id, field), selected in analysis_filters.items()
+            if table_id == 4
+        }
+        matching_result_ids = None
+        if any(result.values()):
+            cache_key = tuple(
+                (field, tuple(sorted(selected)))
+                for field, selected in sorted(result.items())
+                if selected
+            )
+            if cache_key not in self._egt_result_filter_cache:
+                self._load_egt_result_filter(cache_key, result)
+                return None
+            matching_result_ids = self._egt_result_filter_cache[cache_key]
+        if any(direct.values()) or matching_result_ids is not None:
+            parents = {
+                row.get("puurauk_vaatluspunkt_id")
+                for row in self.egt_filter_rows["analyses"]
+                if self._row_matches_domains(row, direct)
+                and (
+                    matching_result_ids is None
+                    or str(row.get("globalid")).upper() in matching_result_ids
+                )
+            }
+            clauses.append(self._id_membership_clause(parents))
+        return clauses
+
+    def _load_egt_result_filter(self, cache_key, result_filters):
+        if cache_key in self._egt_result_filter_loading:
+            return
+        self._egt_result_filter_loading.add(cache_key)
+        parts = []
+        for field, selected in result_filters.items():
+            if not selected:
+                continue
+            quoted = ", ".join(
+                f"'{str(value).replace(chr(39), chr(39) * 2)}'"
+                for value in sorted(selected)
+            )
+            parts.append(f"{field} IN ({quoted})")
+        where = " AND ".join(parts) or "1=1"
+
+        def loaded(rows):
+            self._egt_result_filter_loading.discard(cache_key)
+            self._egt_result_filter_cache[cache_key] = {
+                str(row.get("analyys_mootmine_id")).upper()
+                for row in rows if row.get("analyys_mootmine_id")
+            }
+            self.apply_egt_filters()
+
+        def failed(error):
+            self._egt_result_filter_loading.discard(cache_key)
+            self.warning(
+                (f"Could not load EGT result filter: {error}"
+                 if self.language == "en" else
+                 f"EGT analüüsitulemuse filtri laadimine ebaõnnestus: {error}")
+            )
+
+        self.network.query_auq_all(
+            4, where, ("objectid", "analyys_mootmine_id"),
+            loaded, failed,
+        )
 
     def _ensure_related_index(self):
         if self.related_index_loading:
@@ -1039,6 +1355,762 @@ class QeoloogPlugin:
             clauses.append('("klassif_yksus_kood" IS NULL OR "klassif_yksus_kood" NOT IN (1, 2, 3))')
         return " OR ".join(clauses) or '"klassif_yksus_kood" = -999999'
 
+    # ---- SARV filters -------------------------------------------------------------
+
+    def apply_sarv_filters(self):
+        if not self.dock:
+            return
+        requirements = self.dock.sarv_filters.requirements()
+        self._sarv_filter_generation += 1
+        generation = self._sarv_filter_generation
+        project = QgsProject.instance()
+        layers = {
+            role: self._role_layers(role)
+            for role in ("sarv_localities", "sarv_sites", "sarv_drillcores")
+        }
+        base_parts = []
+        if requirements["depth_min"] is not None:
+            base_parts.append(f'"depth" >= {requirements["depth_min"]:g}')
+        if requirements["depth_max"] is not None:
+            base_parts.append(f'"depth" <= {requirements["depth_max"]:g}')
+        if requirements["current_extent"]:
+            try:
+                extent = self.iface.mapCanvas().extent()
+                transform = QgsCoordinateTransform(
+                    self.iface.mapCanvas().mapSettings().destinationCrs(),
+                    QgsCoordinateReferenceSystem("EPSG:4326"),
+                    project,
+                )
+                extent = transform.transformBoundingBox(extent)
+                base_parts.extend((
+                    f"$x >= {extent.xMinimum():.10f}",
+                    f"$x <= {extent.xMaximum():.10f}",
+                    f"$y >= {extent.yMinimum():.10f}",
+                    f"$y <= {extent.yMaximum():.10f}",
+                ))
+            except QgsCsException:
+                pass
+        base_expression = " AND ".join(base_parts)
+        for role, role_layers in layers.items():
+            visible = role in requirements["kinds"]
+            for layer in role_layers:
+                layer.setSubsetString(base_expression)
+                node = project.layerTreeRoot().findLayer(layer.id())
+                if node:
+                    node.setItemVisibilityChecked(visible)
+                layer.triggerRepaint()
+
+        related_active = any(
+            value != "any" for value in requirements["related"].values()
+        )
+        advanced = (
+            related_active or requirements["sample_purpose"]
+            or requirements["sample_type"] or requirements["analysis_method"]
+        )
+        if advanced:
+            self._load_sarv_filter_matches(
+                generation, requirements, layers, base_expression
+            )
+
+    def _load_sarv_filter_matches(
+        self, generation, requirements, layers, base_expression,
+    ):
+        candidate = {"locality": set(), "site": set()}
+        for role, role_layers in layers.items():
+            for layer in role_layers:
+                for feature in layer.getFeatures():
+                    locality_id = feature["locality_id"]
+                    target = "site" if role == "sarv_sites" else "locality"
+                    target_id = (
+                        feature["sarv_id"] if target == "site" else locality_id
+                    )
+                    if target_id in (None, ""):
+                        continue
+                    candidate[target].add(str(target_id))
+        if not any(candidate.values()):
+            return
+
+        conditions = []
+        for key in ("samples", "analyses", "specimens"):
+            requirement = requirements["related"].get(key, "any")
+            selected = (
+                key == "samples" and (
+                    requirements["sample_purpose"] or requirements["sample_type"]
+                )
+            ) or (
+                key == "analyses" and requirements["analysis_method"]
+            )
+            if requirement != "any" or selected:
+                conditions.append((key, requirement if not selected else "yes"))
+        core_requirement = requirements["related"].get("core", "any")
+        matched = {}
+        if core_requirement != "any":
+            core_localities = set()
+            for layer in layers.get("sarv_drillcores", []):
+                for feature in layer.getFeatures():
+                    locality_id = feature["locality_id"]
+                    if locality_id not in (None, ""):
+                        core_localities.add(str(locality_id))
+            matched["core"] = {
+                ("locality", identifier) for identifier in core_localities
+            }
+
+        def apply_finished():
+            if generation != self._sarv_filter_generation:
+                return
+            def membership(field, target, matches, requirement):
+                universe = candidate[target]
+                present = {
+                    identifier for match_target, identifier in matches
+                    if match_target == target
+                }.intersection(universe)
+                desired = present if requirement == "yes" else universe - present
+                excluded = universe - desired
+                use_in = len(desired) <= len(excluded)
+                values = desired if use_in else excluded
+                if not values:
+                    return f'"{field}" = -1' if use_in else "TRUE"
+                literals = ", ".join(
+                    value if str(value).lstrip("-").isdigit()
+                    else f"'{str(value).replace(chr(39), chr(39) * 2)}'"
+                    for value in sorted(values)
+                )
+                operator = "IN" if use_in else "NOT IN"
+                return f'"{field}" {operator} ({literals})'
+
+            for role, role_layers in layers.items():
+                target = "site" if role == "sarv_sites" else "locality"
+                field = (
+                    "locality_id" if role == "sarv_drillcores"
+                    else "sarv_id"
+                )
+                clauses = [base_expression] if base_expression else []
+                for condition, requirement in conditions:
+                    clauses.append(membership(
+                        field, target, matched.get(condition, set()), requirement
+                    ))
+                if core_requirement != "any":
+                    clauses.append(membership(
+                        field, target, matched.get("core", set()),
+                        core_requirement,
+                    ))
+                expression = " AND ".join(
+                    f"({clause})" for clause in clauses if clause and clause != "TRUE"
+                )
+                for layer in role_layers:
+                    layer.setSubsetString(expression)
+                    layer.triggerRepaint()
+
+        def load_condition(index):
+            if generation != self._sarv_filter_generation:
+                return
+            if index >= len(conditions):
+                apply_finished()
+                return
+            condition, _ = conditions[index]
+            matched[condition] = set()
+            requests = []
+            for target in ("locality", "site"):
+                ids = sorted(candidate[target])
+                if condition == "specimens" and target == "site":
+                    continue
+                for offset in range(0, len(ids), 500):
+                    chunk = ids[offset:offset + 500]
+                    if condition == "samples":
+                        purposes = (
+                            sorted(requirements["sample_purpose"]) or [None]
+                        )
+                        sample_types = (
+                            sorted(requirements["sample_type"]) or [None]
+                        )
+                        requests.extend(
+                            (target, chunk, purpose, sample_type)
+                            for purpose in purposes for sample_type in sample_types
+                        )
+                    else:
+                        requests.append((target, chunk, None, None))
+            if not requests:
+                load_condition(index + 1)
+                return
+            remaining = {"count": len(requests)}
+
+            def completed():
+                remaining["count"] -= 1
+                if remaining["count"] == 0:
+                    load_condition(index + 1)
+
+            for target, ids, purpose, sample_type in requests:
+                if condition == "samples":
+                    resource = "samples"
+                    parameters = {
+                        f"{target}__in": ",".join(ids),
+                        "purpose": purpose,
+                        "type": sample_type,
+                    }
+                    fields = ("id", target)
+                elif condition == "analyses":
+                    resource = "analyses"
+                    parameters = {
+                        f"sample__{target}__in": ",".join(ids),
+                        "analysis_method__in": ",".join(
+                            sorted(requirements["analysis_method"])
+                        ),
+                    }
+                    fields = ("id", "sample")
+                else:
+                    resource = "specimens"
+                    parameters = {"locality__in": ",".join(ids)}
+                    fields = ("id", "locality")
+
+                def loaded(rows, target=target, condition=condition):
+                    if condition == "analyses":
+                        sample_ids = {
+                            str(row.get("sample"))
+                            for row in rows
+                            if row.get("sample") not in (None, "")
+                        }
+                        if not sample_ids:
+                            completed()
+                            return
+                        chunks = [
+                            sorted(sample_ids)[offset:offset + 500]
+                            for offset in range(0, len(sample_ids), 500)
+                        ]
+                        parent_pending = {"count": len(chunks)}
+
+                        def parents_loaded(samples):
+                            for sample in samples:
+                                value = sample.get(target)
+                                if isinstance(value, dict):
+                                    value = value.get("id")
+                                if value not in (None, ""):
+                                    matched[condition].add((target, str(value)))
+                            parent_pending["count"] -= 1
+                            if parent_pending["count"] == 0:
+                                completed()
+
+                        def parents_failed(error):
+                            self.warning(
+                                (f"Could not apply a SARV analysis filter: {error}"
+                                 if self.language == "en" else
+                                 f"SARV analüüsifiltri rakendamine ebaõnnestus: {error}")
+                            )
+                            parent_pending["count"] -= 1
+                            if parent_pending["count"] == 0:
+                                completed()
+
+                        for chunk in chunks:
+                            self.network.query_sarv_pages(
+                                "samples", {"id__in": ",".join(chunk)},
+                                ("id", target), parents_loaded, parents_failed,
+                                limit=5000,
+                            )
+                        return
+                    for row in rows:
+                        value = row.get(target)
+                        if isinstance(value, dict):
+                            value = value.get("id")
+                        if value not in (None, ""):
+                            matched[condition].add((target, str(value)))
+                    completed()
+
+                def failed(error):
+                    self.warning(
+                        (f"Could not apply a SARV filter: {error}"
+                         if self.language == "en" else
+                         f"SARV filtri rakendamine ebaõnnestus: {error}")
+                    )
+                    completed()
+
+                self.network.query_sarv_pages(
+                    resource, parameters, fields, loaded, failed, limit=5000,
+                )
+
+        load_condition(0)
+
+    # ---- Shared EGT/SARV search ---------------------------------------------------
+
+    def run_search(self, criteria, callback):
+        source = criteria.get("source", "both")
+        wants_egt = source in {"both", "egt"}
+        wants_sarv = source in {"both", "sarv"}
+        related = criteria.get("related", {})
+        sarv_choices = any(
+            value.startswith("sarv:")
+            for key in ("sample_type", "sample_purpose", "analysis_method")
+            for value in criteria.get(key, set())
+        ) or any(value != "any" for value in related.values())
+        if wants_sarv and sarv_choices and "_sarv_allowed" not in criteria:
+            self._resolve_sarv_search_allowed(
+                criteria,
+                lambda allowed: self.run_search(
+                    {**criteria, "_sarv_allowed": allowed}, callback
+                ),
+                lambda error: callback(
+                    [],
+                    (f"SARV search failed: {error}" if self.language == "en"
+                     else f"SARV otsing ebaõnnestus: {error}"),
+                ),
+            )
+            return
+        egt_choices = any(
+            value.startswith("egt:")
+            for key in ("sample_type", "sample_purpose", "analysis_method")
+            for value in criteria.get(key, set())
+        )
+        if (
+            wants_egt
+            and any(value != "any" for value in related.values())
+            and len(self.related_index) < 4
+        ):
+            self._ensure_related_index()
+            callback(
+                [],
+                self.t("EGT seotud-andmete indeksit laaditakse. "
+                       "Vajuta hetke pärast uuesti Otsi."),
+            )
+            return
+        if wants_egt and egt_choices and not all(self.egt_filter_rows.values()):
+            self._ensure_egt_filter_catalog()
+            callback(
+                [],
+                self.t("EGT proovi- ja analüüsiindeksit laaditakse. "
+                       "Vajuta hetke pärast uuesti Otsi."),
+            )
+            return
+
+        allowed_egt = None
+        if wants_egt and egt_choices:
+            sample_filters = {
+                "proov_tyyp": {
+                    value[4:] for value in criteria.get("sample_type", set())
+                    if value.startswith("egt:")
+                },
+                "eesmark": {
+                    value[4:] for value in criteria.get("sample_purpose", set())
+                    if value.startswith("egt:")
+                },
+            }
+            analysis_filters = {
+                "analyys_meetod": {
+                    value[4:] for value in criteria.get("analysis_method", set())
+                    if value.startswith("egt:")
+                },
+            }
+            groups = []
+            if any(sample_filters.values()):
+                groups.append({
+                    str(row.get("puurauk_vaatluspunkt_id")).upper()
+                    for row in self.egt_filter_rows["samples"]
+                    if self._row_matches_domains(row, sample_filters)
+                })
+            if any(analysis_filters.values()):
+                groups.append({
+                    str(row.get("puurauk_vaatluspunkt_id")).upper()
+                    for row in self.egt_filter_rows["analyses"]
+                    if self._row_matches_domains(row, analysis_filters)
+                })
+            allowed_egt = set.intersection(*groups) if groups else None
+
+        text_query = str(criteria.get("text") or "").casefold()
+        depth_min = criteria.get("depth_min")
+        depth_max = criteria.get("depth_max")
+        canvas_extent = self.iface.mapCanvas().extent()
+        rows = []
+        loaded_sources = set()
+        roles = []
+        if wants_egt:
+            roles.extend(("boreholes", "observations"))
+        if wants_sarv:
+            roles.extend(("sarv_localities", "sarv_sites", "sarv_drillcores"))
+        selected_roles = criteria.get("kinds")
+        if selected_roles is not None:
+            roles = [role for role in roles if role in selected_roles]
+        for role in roles:
+            for layer in self._role_layers(role):
+                loaded_sources.add("SARV" if role.startswith("sarv_") else "EGT")
+                request = QgsFeatureRequest()
+                if criteria.get("current_extent"):
+                    try:
+                        extent = QgsCoordinateTransform(
+                            self.iface.mapCanvas().mapSettings().destinationCrs(),
+                            layer.crs(), QgsProject.instance(),
+                        ).transformBoundingBox(canvas_extent)
+                        request.setFilterRect(extent)
+                    except QgsCsException:
+                        pass
+                for feature in layer.getFeatures(request):
+                    attributes = {
+                        field.name(): feature.attribute(field.name())
+                        for field in layer.fields()
+                    }
+                    is_sarv = role.startswith("sarv_")
+                    object_id = (
+                        attributes.get("sarv_id") if is_sarv else
+                        attributes.get("esri_globalid") or attributes.get("globalid")
+                    )
+                    if is_sarv and "_sarv_allowed" in criteria:
+                        target = "site" if role == "sarv_sites" else "locality"
+                        target_id = (
+                            attributes.get("sarv_id") if target == "site"
+                            else attributes.get("locality_id")
+                        )
+                        if (target, str(target_id)) not in criteria["_sarv_allowed"]:
+                            continue
+                    if not is_sarv and allowed_egt is not None:
+                        if str(object_id).upper() not in allowed_egt:
+                            continue
+                    if not is_sarv:
+                        object_key = str(object_id).upper()
+                        rejected = False
+                        for key, requirement in related.items():
+                            if requirement == "any":
+                                continue
+                            present = object_key in self.related_index.get(key, set())
+                            if (
+                                (requirement == "yes" and not present)
+                                or (requirement == "no" and present)
+                            ):
+                                rejected = True
+                                break
+                        if rejected:
+                            continue
+                    depth = (
+                        attributes.get("depth") if is_sarv else
+                        attributes.get("pikkus") or attributes.get("vertikaalne_ulatus")
+                    )
+                    try:
+                        numeric_depth = float(depth) if depth not in (None, "") else None
+                    except (TypeError, ValueError):
+                        numeric_depth = None
+                    if depth_min is not None and (
+                        numeric_depth is None or numeric_depth < depth_min
+                    ):
+                        continue
+                    if depth_max is not None and (
+                        numeric_depth is None or numeric_depth > depth_max
+                    ):
+                        continue
+                    name = (
+                        attributes.get("name_en") if is_sarv and self.language == "en"
+                        else attributes.get("name") if is_sarv
+                        else attributes.get("nimi")
+                    ) or attributes.get("name") or attributes.get("alias") or attributes.get("number") or object_id
+                    searchable = " ".join(
+                        str(value) for value in (
+                            name, object_id, attributes.get("number"),
+                            attributes.get("gea_id"), attributes.get("land_board_id"),
+                        ) if value not in (None, "")
+                    ).casefold()
+                    if text_query and text_query not in searchable:
+                        continue
+                    rows.append({
+                        "source": "SARV" if is_sarv else "EGT",
+                        "type": self.t({
+                            "boreholes": "Puurauk",
+                            "observations": "Vaatluspunkt",
+                            "sarv_localities": "Lokaliteet",
+                            "sarv_sites": "Uuringupunkt",
+                            "sarv_drillcores": "Puursüdamik",
+                        }.get(role, role)),
+                        "name": name,
+                        "id": object_id,
+                        "depth": numeric_depth,
+                        "_layer_id": layer.id(),
+                        "_feature_id": int(feature.id()),
+                        "_role": role,
+                    })
+                    if len(rows) >= 500:
+                        break
+                if len(rows) >= 500:
+                    break
+            if len(rows) >= 500:
+                break
+        rows.sort(key=lambda row: (
+            str(row.get("source")), str(row.get("name") or "").casefold()
+        ))
+        missing = []
+        if wants_egt and "EGT" not in loaded_sources:
+            missing.append("EGT")
+        if wants_sarv and "SARV" not in loaded_sources:
+            missing.append("SARV")
+        message = (
+            f"{len(rows)} {self.t('tulemust')}"
+            + (
+                ". " + self.t("Laadi otsimiseks esmalt kihid: ")
+                + ", ".join(missing)
+                if missing else ""
+            )
+            + (f". {self.t('Kuvatakse esimesed 500.')}" if len(rows) >= 500 else "")
+        )
+        callback(rows, message)
+
+    def _resolve_sarv_search_allowed(self, criteria, success, failure):
+        candidate = {"locality": set(), "site": set()}
+        text_query = str(criteria.get("text") or "").casefold()
+        depth_min = criteria.get("depth_min")
+        depth_max = criteria.get("depth_max")
+        for role in ("sarv_localities", "sarv_sites", "sarv_drillcores"):
+            if criteria.get("kinds") is not None and role not in criteria["kinds"]:
+                continue
+            target = "site" if role == "sarv_sites" else "locality"
+            for layer in self._role_layers(role):
+                request = QgsFeatureRequest()
+                if criteria.get("current_extent"):
+                    try:
+                        request.setFilterRect(QgsCoordinateTransform(
+                            self.iface.mapCanvas().mapSettings().destinationCrs(),
+                            layer.crs(), QgsProject.instance(),
+                        ).transformBoundingBox(self.iface.mapCanvas().extent()))
+                    except QgsCsException:
+                        pass
+                for feature in layer.getFeatures(request):
+                    attributes = {
+                        field.name(): feature.attribute(field.name())
+                        for field in layer.fields()
+                    }
+                    name = (
+                        attributes.get("name_en") if self.language == "en"
+                        else attributes.get("name")
+                    ) or attributes.get("name") or attributes.get("number")
+                    searchable = " ".join(
+                        str(value) for value in (
+                            name, attributes.get("number"),
+                            attributes.get("sarv_id"),
+                            attributes.get("land_board_id"),
+                        ) if value not in (None, "")
+                    ).casefold()
+                    if text_query and text_query not in searchable:
+                        continue
+                    depth = attributes.get("depth")
+                    try:
+                        depth = float(depth) if depth not in (None, "") else None
+                    except (TypeError, ValueError):
+                        depth = None
+                    if depth_min is not None and (
+                        depth is None or depth < depth_min
+                    ):
+                        continue
+                    if depth_max is not None and (
+                        depth is None or depth > depth_max
+                    ):
+                        continue
+                    value = (
+                        feature["sarv_id"] if target == "site"
+                        else feature["locality_id"]
+                    )
+                    if value not in (None, ""):
+                        candidate[target].add(str(value))
+        if not any(candidate.values()):
+            success(set())
+            return
+
+        conditions = []
+        sample_types = {
+            value[5:] for value in criteria.get("sample_type", set())
+            if value.startswith("sarv:")
+        }
+        sample_purposes = {
+            value[5:] for value in criteria.get("sample_purpose", set())
+            if value.startswith("sarv:")
+        }
+        methods = {
+            value[5:] for value in criteria.get("analysis_method", set())
+            if value.startswith("sarv:")
+        }
+        related = criteria.get("related", {})
+        sample_requirement = related.get("samples", "any")
+        analysis_requirement = related.get("analyses", "any")
+        if sample_types or sample_purposes or sample_requirement != "any":
+            conditions.append((
+                "samples", sample_types, sample_purposes,
+                "yes" if sample_types or sample_purposes else sample_requirement,
+            ))
+        if methods or analysis_requirement != "any":
+            conditions.append((
+                "analyses", methods, set(),
+                "yes" if methods else analysis_requirement,
+            ))
+        universe = {
+            (target, identifier)
+            for target, identifiers in candidate.items()
+            for identifier in identifiers
+        }
+        condition_sets = []
+        core_requirement = related.get("core", "any")
+        if core_requirement != "any":
+            core_matches = set()
+            for layer in self._role_layers("sarv_drillcores"):
+                for feature in layer.getFeatures():
+                    locality_id = feature["locality_id"]
+                    if locality_id not in (None, ""):
+                        core_matches.add(("locality", str(locality_id)))
+            core_matches.intersection_update(universe)
+            condition_sets.append(
+                core_matches if core_requirement == "yes"
+                else universe - core_matches
+            )
+        if not conditions:
+            success(set.intersection(*condition_sets) if condition_sets else universe)
+            return
+
+        def load_condition(index):
+            if index >= len(conditions):
+                success(set.intersection(*condition_sets))
+                return
+            kind, selected, purposes, requirement = conditions[index]
+            matches = set()
+            requests = []
+            for target, values in candidate.items():
+                ids = sorted(values)
+                for offset in range(0, len(ids), 500):
+                    chunk = ids[offset:offset + 500]
+                    if kind == "samples":
+                        purpose_values = sorted(purposes) or [None]
+                        type_values = sorted(selected) or [None]
+                        requests.extend(
+                            (target, chunk, purpose, sample_type)
+                            for purpose in purpose_values
+                            for sample_type in type_values
+                        )
+                    else:
+                        requests.append((target, chunk, None, None))
+            remaining = {"count": len(requests), "failed": False}
+
+            def completed():
+                remaining["count"] -= 1
+                if remaining["count"] == 0 and not remaining["failed"]:
+                    condition_sets.append(
+                        matches if requirement == "yes" else universe - matches
+                    )
+                    load_condition(index + 1)
+
+            for target, ids, purpose, sample_type in requests:
+                if kind == "samples":
+                    resource = "samples"
+                    parameters = {
+                        f"{target}__in": ",".join(ids),
+                        "type": sample_type,
+                        "purpose": purpose,
+                    }
+                    fields = ("id", target)
+                else:
+                    resource = "analyses"
+                    parameters = {
+                        f"sample__{target}__in": ",".join(ids),
+                        "analysis_method__in": ",".join(sorted(selected)),
+                    }
+                    fields = ("id", "sample")
+
+                def loaded(rows, target=target, kind=kind):
+                    if kind == "analyses":
+                        sample_ids = {
+                            str(row.get("sample"))
+                            for row in rows
+                            if row.get("sample") not in (None, "")
+                        }
+                        if not sample_ids:
+                            completed()
+                            return
+                        chunks = [
+                            sorted(sample_ids)[offset:offset + 500]
+                            for offset in range(0, len(sample_ids), 500)
+                        ]
+                        parent_pending = {"count": len(chunks)}
+
+                        def parents_loaded(samples):
+                            for sample in samples:
+                                value = sample.get(target)
+                                if isinstance(value, dict):
+                                    value = value.get("id")
+                                if value not in (None, ""):
+                                    matches.add((target, str(value)))
+                            parent_pending["count"] -= 1
+                            if parent_pending["count"] == 0:
+                                completed()
+
+                        def parents_failed(error):
+                            if not remaining["failed"]:
+                                remaining["failed"] = True
+                                failure(error)
+
+                        for chunk in chunks:
+                            self.network.query_sarv_pages(
+                                "samples", {"id__in": ",".join(chunk)},
+                                ("id", target), parents_loaded, parents_failed,
+                                limit=5000,
+                            )
+                        return
+                    for row in rows:
+                        value = row.get(target)
+                        if isinstance(value, dict):
+                            value = value.get("id")
+                        if value not in (None, ""):
+                            matches.add((target, str(value)))
+                    completed()
+
+                def failed(error):
+                    if not remaining["failed"]:
+                        remaining["failed"] = True
+                        failure(error)
+
+                self.network.query_sarv_pages(
+                    resource, parameters, fields, loaded, failed, limit=5000,
+                )
+
+        load_condition(0)
+
+    def open_search_result(self, item):
+        layer = QgsProject.instance().mapLayer(item.get("_layer_id"))
+        if not layer:
+            self.warning(
+                "The result layer is no longer loaded." if self.language == "en"
+                else "Otsingutulemuse kiht ei ole enam laaditud."
+            )
+            return
+        feature = next(
+            layer.getFeatures(
+                QgsFeatureRequest().setFilterFid(item.get("_feature_id"))
+            ),
+            None,
+        )
+        if feature is None:
+            return
+        canvas = self.iface.mapCanvas()
+        try:
+            geometry = QgsGeometry(feature.geometry())
+            geometry.transform(QgsCoordinateTransform(
+                layer.crs(), canvas.mapSettings().destinationCrs(),
+                QgsProject.instance(),
+            ))
+            point = geometry.asPoint()
+            extent = canvas.extent()
+            extent.scale(0.25, point)
+            canvas.setExtent(extent)
+            canvas.refresh()
+        except (QgsCsException, ValueError):
+            pass
+        attributes = {
+            field.name(): feature.attribute(field.name())
+            for field in layer.fields()
+        }
+        role = item.get("_role") or self._layer_role(layer)
+        self._show_highlight(layer, feature)
+        if role.startswith("sarv_"):
+            self._load_sarv_point_details(
+                role, str(item.get("name") or item.get("id")),
+                attributes, layer, feature,
+            )
+        else:
+            global_id = (
+                attributes.get("esri_globalid") or attributes.get("globalid")
+            )
+            if global_id:
+                self._load_details(
+                    role, str(global_id),
+                    str(item.get("name") or item.get("id")), attributes,
+                )
+
     @classmethod
     def _role_layers(cls, role):
         return [
@@ -1060,7 +2132,7 @@ class QeoloogPlugin:
                 self.previous_map_tool = canvas.mapTool()
                 canvas.setMapTool(self.identify_tool)
             if self.dock:
-                self.dock.tabs.setCurrentWidget(self.dock.filters)
+                self.dock.tabs.setCurrentWidget(self.dock.filter_page)
                 self.dock.show()
         elif canvas.mapTool() is self.identify_tool:
             canvas.setMapTool(self.previous_map_tool) if self.previous_map_tool else canvas.unsetMapTool(self.identify_tool)

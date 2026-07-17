@@ -1,4 +1,4 @@
-# Qeoloog 3.6.1
+# Qeoloog 3.7.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -59,6 +59,11 @@ geoloogia rühma. Seadistus säilib QGIS-i kasutajaprofiilis.
 PA ja VP kihte saab filtreerida ulatuse järgi: pinnakate, aluspõhi, aluskord või
 muu/teadmata ning selle järgi, kas objektil leidub puursüdamikku, proove,
 analüüse või manuseid. Iga seotud-andmete filter toetab valikuid Kõik/Jah/Ei.
+EGT proovide tüüpi, eesmärki ja staatust ning analüüside meetodit, laborit,
+tulemuse tüüpi ja näitajat saab valida linnukestega mitmikvalikust. EGT
+koodinimetused loetakse automaatselt teenuse ametlikest ArcGIS-domeenidest ja
+neid kasutatakse nii objektivaates kui filtrites. Sama välja valikud seotakse
+OR-tingimusega, eri väljad AND-tingimusega; tühi valik tähendab kõiki.
 Puuraukude nimed kuvatakse vaikimisi 5 pt sildina 0,6 mm valge puhvriga.
 Vajuta **i**, seejärel klõpsa kaardil puuraugul või vaatluspunktis.
 Hetkel avatavat punkti tähistab kaardil kerge halo. Objektivaade sisaldab:
@@ -90,6 +95,19 @@ Puursüdamik kuvatakse seotud lokaliteedi koordinaadil; koordinaadita kirjeid
 kaardile ei lisata. Puursüdamiku punktilt saab avada valitud südamiku kastid,
 pildid ning lokaliteediga seotud proovid, analüüsid, eksemplarid ja kirjanduse.
 Neid kihte saab sama kaardiklõpsu tööriistaga avada nagu EGT punkte.
+
+Eraldi **SARV filtrid** paanis saab lülitada lokaliteete, uuringupunkte ja
+puursüdamikke, piirata tulemust kaardiulatuse ja sügavusega ning valida
+puursüdamiku, proovide, analüüside või eksemplaride olemasolu. Proovi eesmärk
+ja tüüp ning analüüsimeetod on mitmikvalikud. Mahukad seotud andmed päritakse
+SARV serverist alles filtri rakendamisel.
+
+**Otsing** leiab samast tabelist laaditud EGT puuraugud/vaatluspunktid ja SARV
+kohad nime, numbri või ID, kaardiulatuse, sügavuse ning proovi- või
+analüüsitunnuste järgi. Otsingus saab eraldi valida objektitüübid ning
+puursüdamiku, proovide ja analüüside olemasolu. Tulemust saab nupust kaardil
+avada ja objektivaatesse laadida. Kuvatakse kuni 500 esimest vastet ning
+allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
 
 EGT ja SARV automaatne seos kinnitatakse ainult tugeva ning ühese tõendi korral,
 näiteks ametliku tunnuse või lähestikku asuvate samanimeliste/-numbriliste
