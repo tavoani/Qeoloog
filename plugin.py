@@ -991,10 +991,49 @@ class QeoloogPlugin:
         definitions = {self._source_id(item): item for item in self.definitions}
         for layer in QgsProject.instance().mapLayers().values():
             definition = definitions.get(self._layer_source_id(layer))
+            adopted = False
+            if not definition:
+                definition = self._definition_from_wfs_source(layer)
+                adopted = definition is not None
             if not definition:
                 continue
+            if adopted:
+                # Older projects can contain a Qeoloog WFS layer whose custom
+                # properties were not persisted. Re-associate only an exact
+                # service URL + typename match, then restore the plugin style.
+                layer.setCustomProperty(
+                    self.SOURCE_PROPERTY, self._source_id(definition)
+                )
+                layer.setCustomProperty(self.ROLE_PROPERTY, definition.role)
+                if definition.role and isinstance(layer, QgsVectorLayer):
+                    self._apply_category_renderer(layer)
+                    if definition.role == "boreholes":
+                        self._apply_borehole_labeling(layer)
             self._apply_layer_workarounds(layer, definition)
+        self.sync_dropdown_checks()
         self._ensure_egt_points_on_top()
+
+    def _definition_from_wfs_source(self, layer):
+        """Return the exact configured WFS definition for an untagged layer."""
+        if not isinstance(layer, QgsVectorLayer) or layer.providerType() != "WFS":
+            return None
+        try:
+            uri = QgsDataSourceUri(layer.source())
+            service_url = uri.param("url").strip().rstrip("/").casefold()
+            typename = uri.param("typename").strip().casefold()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not service_url or not typename:
+            return None
+        for definition in self.definitions:
+            if definition.protocol.upper() != "WFS":
+                continue
+            if (
+                definition.url.strip().rstrip("/").casefold() == service_url
+                and definition.layer_name.strip().casefold() == typename
+            ):
+                return definition
+        return None
 
     def _apply_layer_workarounds(self, layer, definition):
         if (

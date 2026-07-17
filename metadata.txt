@@ -2,7 +2,7 @@
 name=Qeoloog
 description=EGT GEA ja SARV geoloogiaandmete kuvamise ja uurimise rakendus koos MaRu WMS/WFS teenuste toega.
 about=Qeoloog kuvab ja seob eelkõige EGT GEA ning SARV andmebaaside geoloogiaandmeid: puuraukude ja vaatluspunktide üldandmeid, läbilõikeid, puursüdamikke ja nende pilte, proove, analüüse, eksemplare, manuseid ning kirjandust. Lisaks saab avada ja seadistada Maa- ja Ruumiameti (MaRu) ning teiste avalike andmeallikate WMS/WFS teenuseid.
-version=3.7.0
+version=3.7.1
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
 author=Tavoani
@@ -13,7 +13,8 @@ experimental=False
 deprecated=False
 server=False
 hasProcessingProvider=False
-changelog=3.7.0 - Added official EGT code decoding, multi-select EGT/SARV filters and shared search.
+changelog=3.7.1 - Restores Qeoloog roles, category symbols and borehole labels for untagged WFS layers in older projects.
+    3.7.0 - Added official EGT code decoding, multi-select EGT/SARV filters and shared search.
     3.6.1 - Added SARV drill cores to SK locations using their linked locality coordinates.
     3.6.0 - Added SK SARV locality/research-site layers, point details and conservative persisted EGT-SARV matching.
     3.5.2 - Reordered geological-log columns to depth, index, EGT/SARV markers and lithology.
