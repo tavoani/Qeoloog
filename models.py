@@ -153,6 +153,7 @@ class PluginSettings:
     KEY_LANGUAGE = "language"
     KEY_GROUPS = "groups_json"
     KEY_SARV_MATCHES = "sarv_matches_json"
+    KEY_PERSONAL_GPKG = "personal_gpkg"
 
     @classmethod
     def load_layers(cls):
@@ -262,4 +263,16 @@ class PluginSettings:
         QgsSettings().setValue(
             f"{cls.ORGANIZATION}/{cls.KEY_SARV_MATCHES}",
             json.dumps(matches, ensure_ascii=False),
+        )
+
+    @classmethod
+    def load_personal_gpkg(cls):
+        return QgsSettings().value(
+            f"{cls.ORGANIZATION}/{cls.KEY_PERSONAL_GPKG}", "", type=str,
+        )
+
+    @classmethod
+    def save_personal_gpkg(cls, path):
+        QgsSettings().setValue(
+            f"{cls.ORGANIZATION}/{cls.KEY_PERSONAL_GPKG}", str(path or ""),
         )

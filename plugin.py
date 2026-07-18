@@ -42,6 +42,7 @@ from .i18n import GROUP_LABELS, translate
 from .identify import EgtIdentifyTool
 from .models import DEFAULT_GROUP_STATE, GROUPS, PluginSettings
 from .network import NetworkClient
+from .personal import PersonalStore
 
 
 class QeoloogPlugin:
@@ -115,6 +116,14 @@ class QeoloogPlugin:
         self.sarv_sample_type_options = []
         self._sarv_filter_generation = 0
         self.sarv_matches = PluginSettings.load_sarv_matches()
+        self.personal_store = PersonalStore()
+        self._personal_context = {}
+        personal_path = PluginSettings.load_personal_gpkg()
+        if personal_path:
+            try:
+                self.personal_store.open(personal_path)
+            except (OSError, ValueError):
+                PluginSettings.save_personal_gpkg("")
 
     def t(self, text):
         return translate(text, self.language)
@@ -177,6 +186,90 @@ class QeoloogPlugin:
             f"Eksporditi {len(rows)} SARV seost faili {target}."
         )
         return target
+
+    def create_personal_workspace(self, path):
+        try:
+            target = Path(path)
+            if target.suffix.casefold() != ".gpkg":
+                target = target.with_suffix(".gpkg")
+            self.personal_store.create(target)
+            PluginSettings.save_personal_gpkg(target)
+            self.success(
+                f"Created personal GeoPackage: {target}"
+                if self.language == "en" else
+                f"Isiklik GeoPackage loodi: {target}"
+            )
+            return target
+        except Exception as error:
+            self.warning(
+                f"Could not create personal GeoPackage: {error}"
+                if self.language == "en" else
+                f"Isiklikku GeoPackage'it ei saanud luua: {error}"
+            )
+            return None
+
+    def open_personal_workspace(self, path):
+        try:
+            target = self.personal_store.open(path)
+            PluginSettings.save_personal_gpkg(target)
+            self.refresh_personal_details()
+            self.success(
+                f"Opened personal GeoPackage: {target}"
+                if self.language == "en" else
+                f"Isiklik GeoPackage avati: {target}"
+            )
+            return target
+        except Exception as error:
+            self.warning(
+                f"Could not open personal GeoPackage: {error}"
+                if self.language == "en" else
+                f"Isiklikku GeoPackage'it ei saanud avada: {error}"
+            )
+            return None
+
+    def set_personal_context(
+        self, source_system, source_type, source_id, gea_id="", sarv_id="", name="",
+    ):
+        self._personal_context = {
+            "source_system": source_system,
+            "source_type": source_type,
+            "source_id": str(source_id or ""),
+            "gea_id": str(gea_id or ""),
+            "sarv_id": str(sarv_id or ""),
+            "name": str(name or ""),
+        }
+        if self.dock:
+            self.dock.personal.set_context(**self._personal_context)
+        self.refresh_personal_details()
+
+    def refresh_personal_details(self):
+        if not self.dock:
+            return
+        context = self._personal_context
+        if not context or not self.personal_store.is_open:
+            self.dock.details.set_personal_samples([])
+            self.dock.details.set_personal_analyses([])
+            self.dock.details.set_personal_specimens([])
+            if self.dock:
+                self.dock.personal.refresh()
+            return
+        try:
+            rows = self.personal_store.records_for_object(
+                context["source_system"], context["source_type"],
+                context["source_id"], context.get("gea_id", ""),
+                context.get("sarv_id", ""),
+            )
+        except Exception as error:
+            self.warning(
+                f"Could not read personal data: {error}"
+                if self.language == "en" else
+                f"Isiklike andmete lugemine ebaõnnestus: {error}"
+            )
+            return
+        self.dock.details.set_personal_samples(rows["samples"])
+        self.dock.details.set_personal_analyses(rows["analyses"])
+        self.dock.details.set_personal_specimens(rows["specimens"])
+        self.dock.personal.refresh()
 
     def decode_egt(self, table_id, field, value):
         """Return an official EGT domain label while preserving unknown values."""
@@ -529,6 +622,9 @@ class QeoloogPlugin:
         self.dock.deleteLater()
         self.dock = None
         self._create_dock(tab_index, visible)
+        if self._personal_context:
+            self.dock.personal.set_context(**self._personal_context)
+            self.refresh_personal_details()
         self._build_actions()
         self._sync_identify_controls(identify_checked)
 
@@ -2401,6 +2497,17 @@ class QeoloogPlugin:
         details = self.dock.details
         self.dock.show_details()
         details.show_loading(name, attributes, role)
+        self.set_personal_context(
+            "SARV",
+            {
+                "sarv_localities": "locality",
+                "sarv_sites": "site",
+                "sarv_drillcores": "drillcore",
+            }.get(role, "locality"),
+            attributes.get("sarv_id") or "",
+            sarv_id=attributes.get("sarv_id") or "",
+            name=name,
+        )
 
         def current(callback):
             return lambda payload: callback(payload) if token == self._detail_token else None
@@ -2441,6 +2548,10 @@ class QeoloogPlugin:
                 else entity.get("name")
             ) or entity.get("name") or entity.get("number") or name
             details.show_loading(str(display_name), overview, role)
+            self.set_personal_context(
+                "SARV", overview["source_type"], entity.get("id"),
+                sarv_id=entity.get("id"), name=display_name,
+            )
             details.set_profile([])
             details.set_attachments([])
             details.set_ready(str(display_name))
@@ -2722,6 +2833,14 @@ class QeoloogPlugin:
         details = self.dock.details
         self.dock.show_details()
         details.show_loading(name, attributes, role)
+        self.set_personal_context(
+            "GEA",
+            "borehole" if role == "boreholes" else "observation",
+            global_id,
+            gea_id=attributes.get("gea_id") or "",
+            sarv_id=attributes.get("sarv_id") or "",
+            name=name,
+        )
         safe_id = global_id.replace("'", "''")
         parent_where = f"puurauk_vaatluspunkt_id = '{safe_id}'"
 
