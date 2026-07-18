@@ -298,6 +298,56 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
+    def query_egt_object_by_gea_id(self, gea_id, success, failure):
+        """Resolve a public numeric GEA ID to its WFS object and UUID."""
+        value = str(gea_id or "").strip()
+        if not value.isdigit():
+            failure("GEA ID must be a positive integer.")
+            return
+        queue = [
+            ("borehole", "faktika:puurauk"),
+            ("observation", "faktika:Vaatluspunkt"),
+        ]
+        errors = []
+
+        def load_next():
+            if not queue:
+                failure(
+                    "; ".join(errors)
+                    if errors else f"GEA object {value} was not found."
+                )
+                return
+            source_type, type_name = queue.pop(0)
+            url = QUrl(EGT_WFS)
+            query = QUrlQuery()
+            for key, parameter in (
+                ("service", "WFS"),
+                ("version", "2.0.0"),
+                ("request", "GetFeature"),
+                ("typeNames", type_name),
+                ("outputFormat", "application/json"),
+                ("count", "2"),
+                ("CQL_FILTER", f"gea_id={value}"),
+            ):
+                query.addQueryItem(key, parameter)
+            url.setQuery(query)
+
+            def decoded(payload):
+                features = payload.get("features", [])
+                if features:
+                    properties = features[0].get("properties", {})
+                    success(source_type, properties)
+                else:
+                    load_next()
+
+            def failed(error):
+                errors.append(str(error))
+                load_next()
+
+            self.get_json(url, decoded, failed)
+
+        load_next()
+
     def query_borehole_profile(self, global_id, success, failure):
         """Load a borehole and its nested geology from EGT's public GEA API."""
         encoded_id = quote(str(global_id), safe="")
@@ -313,7 +363,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.8.1",
+            "QGIS Qeoloog/3.9.1",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

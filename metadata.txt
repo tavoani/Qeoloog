@@ -2,7 +2,7 @@
 name=Qeoloog
 description=EGT GEA ja SARV geoloogiaandmete kuvamise ja uurimise rakendus koos MaRu WMS/WFS teenuste toega.
 about=Qeoloog kuvab ja seob eelkõige EGT GEA ning SARV andmebaaside geoloogiaandmeid: puuraukude ja vaatluspunktide üldandmeid, läbilõikeid, puursüdamikke ja nende pilte, proove, analüüse, eksemplare, manuseid ning kirjandust. Lisaks saab avada ja seadistada Maa- ja Ruumiameti (MaRu) ning teiste avalike andmeallikate WMS/WFS teenuseid.
-version=3.9.0
+version=3.9.1
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
 author=Tavoani
@@ -13,7 +13,8 @@ experimental=False
 deprecated=False
 server=False
 hasProcessingProvider=False
-changelog=3.9.0 - Adds a personal GeoPackage workspace, mapped CSV/XLSX laboratory import, GEA/SARV converter exports, personal detail records, persistent scrollable multi-selects and filter reset buttons.
+changelog=3.9.1 - Personal import target types now depend on the selected source, and GEA/SARV IDs can resolve the remaining target fields automatically.
+    3.9.0 - Adds a personal GeoPackage workspace, mapped CSV/XLSX laboratory import, GEA/SARV converter exports, personal detail records, persistent scrollable multi-selects and filter reset buttons.
     3.8.1 - The local SARV link manager can now link an EGT object to a SARV drill core, locality or research site.
     3.8.0 - Adds validated local EGT-SARV drill-core link corrections, immediate combined-data refresh, reset to the GEA link, and consolidated CSV/JSON export.
     3.7.4 - Treats every GEA sarv_id as a SARV drill-core ID, avoids cross-type ID collisions, and opens confirmed SARV links inside Qeoloog.

@@ -677,6 +677,7 @@ class PersonalDataWidget(QWidget):
     def __init__(self, plugin):
         super().__init__()
         self.plugin = plugin
+        self._lookup_generation = 0
         self._build_ui()
         self.refresh()
 
@@ -714,14 +715,8 @@ class PersonalDataWidget(QWidget):
         self.source_system.addItem("GEA", "GEA")
         self.source_system.addItem("SARV", "SARV")
         self.source_type = QComboBox()
-        for label, value in (
-            (t("Puurauk"), "borehole"),
-            (t("Vaatluspunkt"), "observation"),
-            (t("Lokaliteet"), "locality"),
-            (t("Uuringupunkt"), "site"),
-            (t("Puursüdamik"), "drillcore"),
-        ):
-            self.source_type.addItem(label, value)
+        self.source_system.currentIndexChanged.connect(self._source_changed)
+        self._reload_source_types()
         self.source_id = QLineEdit()
         self.gea_id = QLineEdit()
         self.sarv_id = QLineEdit()
@@ -735,6 +730,18 @@ class PersonalDataWidget(QWidget):
         target_layout.addRow("GEA ID", self.gea_id)
         target_layout.addRow("SARV ID", self.sarv_id)
         target_layout.addRow(t("Nimi"), self.object_name)
+        lookup_button = QPushButton(
+            "Fill from ID" if self.plugin.language == "en"
+            else "Täida ID põhjal"
+        )
+        lookup_button.clicked.connect(self._lookup_target)
+        self.lookup_button = lookup_button
+        target_layout.addRow("", lookup_button)
+        self.lookup_status = QLabel()
+        self.lookup_status.setWordWrap(True)
+        target_layout.addRow("", self.lookup_status)
+        self.gea_id.editingFinished.connect(self._lookup_if_ready)
+        self.sarv_id.editingFinished.connect(self._lookup_if_ready)
         layout.addWidget(target)
 
         import_group = QGroupBox(
@@ -791,6 +798,91 @@ class PersonalDataWidget(QWidget):
         export_layout.addWidget(export_note)
         layout.addWidget(export_group)
         layout.addStretch(1)
+
+    def _source_changed(self):
+        self._lookup_generation += 1
+        self.lookup_button.setEnabled(True)
+        self._reload_source_types()
+        self.source_id.clear()
+        self.gea_id.clear()
+        self.sarv_id.clear()
+        self.object_name.clear()
+        self.lookup_status.clear()
+
+    def _reload_source_types(self):
+        current = self.source_type.currentData()
+        self.source_type.blockSignals(True)
+        self.source_type.clear()
+        if self.source_system.currentData() == "SARV":
+            options = (
+                (self.plugin.t("Lokaliteet"), "locality"),
+                (self.plugin.t("Uuringupunkt"), "site"),
+                (self.plugin.t("Puursüdamik"), "drillcore"),
+            )
+        else:
+            options = (
+                (self.plugin.t("Puurauk"), "borehole"),
+                (self.plugin.t("Vaatluspunkt"), "observation"),
+            )
+        for label, value in options:
+            self.source_type.addItem(label, value)
+        index = self.source_type.findData(current)
+        self.source_type.setCurrentIndex(index if index >= 0 else 0)
+        self.source_type.blockSignals(False)
+
+    def _lookup_if_ready(self):
+        if self.source_system.currentData() == "GEA":
+            ready = bool(self.gea_id.text().strip())
+        else:
+            ready = bool(self.sarv_id.text().strip())
+        if ready:
+            self._lookup_target()
+
+    def _lookup_target(self):
+        source_system = self.source_system.currentData()
+        external_id = (
+            self.gea_id.text().strip()
+            if source_system == "GEA"
+            else self.sarv_id.text().strip()
+        )
+        if not external_id:
+            self.lookup_status.setText(
+                "Enter an ID first." if self.plugin.language == "en"
+                else "Sisesta esmalt ID."
+            )
+            return
+        self._lookup_generation += 1
+        generation = self._lookup_generation
+        self.lookup_button.setEnabled(False)
+        self.lookup_status.setStyleSheet("")
+        self.lookup_status.setText(
+            "Looking up object…" if self.plugin.language == "en"
+            else "Objekti otsitakse…"
+        )
+
+        def loaded(values):
+            if generation != self._lookup_generation:
+                return
+            self.lookup_button.setEnabled(True)
+            self.set_context(**values)
+            self.lookup_status.setStyleSheet("color: #2f7d32;")
+            self.lookup_status.setText(
+                "Object details filled from the source."
+                if self.plugin.language == "en" else
+                "Objekti andmed täideti allikast."
+            )
+
+        def failed(error):
+            if generation != self._lookup_generation:
+                return
+            self.lookup_button.setEnabled(True)
+            self.lookup_status.setStyleSheet("color: #a33a32;")
+            self.lookup_status.setText(str(error))
+
+        self.plugin.lookup_personal_target(
+            source_system, self.source_type.currentData(), external_id,
+            loaded, failed,
+        )
 
     def refresh(self):
         store = self.plugin.personal_store

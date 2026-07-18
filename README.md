@@ -1,4 +1,4 @@
-# Qeoloog 3.9.0
+# Qeoloog 3.9.1
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -165,6 +165,13 @@ hulgas analüüsi koodi, eksemplari
 tähist, sügavusintervalli, ühikut, meetodit, laborit, kuupäeva, määramispiiri ja
 määramatust. Vigased või puuduliku võtmeinfoga read lähevad impordiaruandesse,
 mitte ei seostu vaikides vale väljaga.
+
+Impordi sihtobjekti tüübid sõltuvad valitud allikast: GEA puhul saab valida
+puuraugu või vaatluspunkti ning SARV puhul lokaliteedi, uuringupunkti või
+puursüdamiku. GEA või SARV ID sisestamisel täidab Qeoloog allikast automaatselt
+objekti tüübi, sisemise lähte-ID, nime ning olemasolu korral ka teise andmebaasi
+ID. SARV puhul valitakse tüüp enne päringut, sest eri SARV objektitüüpidel võivad
+olla samad numbrilised ID-d.
 
 Samast paanist saab:
 

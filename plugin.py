@@ -227,6 +227,83 @@ class QeoloogPlugin:
             )
             return None
 
+    def lookup_personal_target(
+        self, source_system, source_type, external_id, success, failure,
+    ):
+        """Resolve a user-entered public ID to a personal-data target."""
+        value = str(external_id or "").strip()
+        if not value:
+            failure(
+                "Enter an ID first." if self.language == "en"
+                else "Sisesta esmalt ID."
+            )
+            return
+        if source_system == "GEA":
+            def loaded(resolved_type, attributes):
+                success({
+                    "source_system": "GEA",
+                    "source_type": resolved_type,
+                    "source_id": (
+                        attributes.get("esri_globalid")
+                        or attributes.get("globalid") or ""
+                    ),
+                    "gea_id": attributes.get("gea_id") or value,
+                    "sarv_id": attributes.get("sarv_id") or "",
+                    "name": (
+                        attributes.get("nimi") or attributes.get("alias")
+                        or attributes.get("gea_id") or value
+                    ),
+                })
+
+            self.network.query_egt_object_by_gea_id(
+                value, loaded, failure,
+            )
+            return
+
+        resources = {
+            "locality": "localities",
+            "site": "sites",
+            "drillcore": "drillcores",
+        }
+        resource = resources.get(source_type)
+        if not resource:
+            failure(
+                "Choose a SARV object type." if self.language == "en"
+                else "Vali SARV objekti tüüp."
+            )
+            return
+        if not value.isdigit():
+            failure(
+                "SARV ID must be a positive integer."
+                if self.language == "en" else
+                "SARV ID peab olema positiivne täisarv."
+            )
+            return
+
+        def loaded(entity):
+            if not isinstance(entity, dict) or not entity.get("id"):
+                failure(
+                    "Invalid SARV response." if self.language == "en"
+                    else "SARV vastus ei ole korrektne."
+                )
+                return
+            success({
+                "source_system": "SARV",
+                "source_type": source_type,
+                "source_id": entity.get("id"),
+                "gea_id": entity.get("gea_id") or "",
+                "sarv_id": entity.get("id"),
+                "name": (
+                    entity.get("name_en") if self.language == "en"
+                    else entity.get("name")
+                ) or entity.get("name") or entity.get("number") or entity.get("id"),
+            })
+
+        self.network.query_sarv(
+            f"{resource}/{value}", {"expand": "*"},
+            loaded, failure,
+        )
+
     def set_personal_context(
         self, source_system, source_type, source_id, gea_id="", sarv_id="", name="",
     ):
