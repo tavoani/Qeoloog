@@ -42,7 +42,6 @@ from .i18n import GROUP_LABELS, translate
 from .identify import EgtIdentifyTool
 from .models import DEFAULT_GROUP_STATE, GROUPS, PluginSettings
 from .network import NetworkClient
-from .personal import PersonalStore
 
 
 class QeoloogPlugin:
@@ -81,6 +80,7 @@ class QeoloogPlugin:
         self.definitions = PluginSettings.load_layers()
         self.toggle_mode = PluginSettings.load_toggle_mode()
         self.language = PluginSettings.load_language()
+        self.egt_data_source = PluginSettings.load_egt_data_source()
         self.group_enabled = PluginSettings.load_groups()
         self.network = NetworkClient()
         self.toolbar = None
@@ -116,14 +116,6 @@ class QeoloogPlugin:
         self.sarv_sample_type_options = []
         self._sarv_filter_generation = 0
         self.sarv_matches = PluginSettings.load_sarv_matches()
-        self.personal_store = PersonalStore()
-        self._personal_context = {}
-        personal_path = PluginSettings.load_personal_gpkg()
-        if personal_path:
-            try:
-                self.personal_store.open(personal_path)
-            except (OSError, ValueError):
-                PluginSettings.save_personal_gpkg("")
 
     def t(self, text):
         return translate(text, self.language)
@@ -186,167 +178,6 @@ class QeoloogPlugin:
             f"Eksporditi {len(rows)} SARV seost faili {target}."
         )
         return target
-
-    def create_personal_workspace(self, path):
-        try:
-            target = Path(path)
-            if target.suffix.casefold() != ".gpkg":
-                target = target.with_suffix(".gpkg")
-            self.personal_store.create(target)
-            PluginSettings.save_personal_gpkg(target)
-            self.success(
-                f"Created personal GeoPackage: {target}"
-                if self.language == "en" else
-                f"Isiklik GeoPackage loodi: {target}"
-            )
-            return target
-        except Exception as error:
-            self.warning(
-                f"Could not create personal GeoPackage: {error}"
-                if self.language == "en" else
-                f"Isiklikku GeoPackage'it ei saanud luua: {error}"
-            )
-            return None
-
-    def open_personal_workspace(self, path):
-        try:
-            target = self.personal_store.open(path)
-            PluginSettings.save_personal_gpkg(target)
-            self.refresh_personal_details()
-            self.success(
-                f"Opened personal GeoPackage: {target}"
-                if self.language == "en" else
-                f"Isiklik GeoPackage avati: {target}"
-            )
-            return target
-        except Exception as error:
-            self.warning(
-                f"Could not open personal GeoPackage: {error}"
-                if self.language == "en" else
-                f"Isiklikku GeoPackage'it ei saanud avada: {error}"
-            )
-            return None
-
-    def lookup_personal_target(
-        self, source_system, source_type, external_id, success, failure,
-    ):
-        """Resolve a user-entered public ID to a personal-data target."""
-        value = str(external_id or "").strip()
-        if not value:
-            failure(
-                "Enter an ID first." if self.language == "en"
-                else "Sisesta esmalt ID."
-            )
-            return
-        if source_system == "GEA":
-            def loaded(resolved_type, attributes):
-                success({
-                    "source_system": "GEA",
-                    "source_type": resolved_type,
-                    "source_id": (
-                        attributes.get("esri_globalid")
-                        or attributes.get("globalid") or ""
-                    ),
-                    "gea_id": attributes.get("gea_id") or value,
-                    "sarv_id": attributes.get("sarv_id") or "",
-                    "name": (
-                        attributes.get("nimi") or attributes.get("alias")
-                        or attributes.get("gea_id") or value
-                    ),
-                })
-
-            self.network.query_egt_object_by_gea_id(
-                value, loaded, failure,
-            )
-            return
-
-        resources = {
-            "locality": "localities",
-            "site": "sites",
-            "drillcore": "drillcores",
-        }
-        resource = resources.get(source_type)
-        if not resource:
-            failure(
-                "Choose a SARV object type." if self.language == "en"
-                else "Vali SARV objekti tüüp."
-            )
-            return
-        if not value.isdigit():
-            failure(
-                "SARV ID must be a positive integer."
-                if self.language == "en" else
-                "SARV ID peab olema positiivne täisarv."
-            )
-            return
-
-        def loaded(entity):
-            if not isinstance(entity, dict) or not entity.get("id"):
-                failure(
-                    "Invalid SARV response." if self.language == "en"
-                    else "SARV vastus ei ole korrektne."
-                )
-                return
-            success({
-                "source_system": "SARV",
-                "source_type": source_type,
-                "source_id": entity.get("id"),
-                "gea_id": entity.get("gea_id") or "",
-                "sarv_id": entity.get("id"),
-                "name": (
-                    entity.get("name_en") if self.language == "en"
-                    else entity.get("name")
-                ) or entity.get("name") or entity.get("number") or entity.get("id"),
-            })
-
-        self.network.query_sarv(
-            f"{resource}/{value}", {"expand": "*"},
-            loaded, failure,
-        )
-
-    def set_personal_context(
-        self, source_system, source_type, source_id, gea_id="", sarv_id="", name="",
-    ):
-        self._personal_context = {
-            "source_system": source_system,
-            "source_type": source_type,
-            "source_id": str(source_id or ""),
-            "gea_id": str(gea_id or ""),
-            "sarv_id": str(sarv_id or ""),
-            "name": str(name or ""),
-        }
-        if self.dock:
-            self.dock.personal.set_context(**self._personal_context)
-        self.refresh_personal_details()
-
-    def refresh_personal_details(self):
-        if not self.dock:
-            return
-        context = self._personal_context
-        if not context or not self.personal_store.is_open:
-            self.dock.details.set_personal_samples([])
-            self.dock.details.set_personal_analyses([])
-            self.dock.details.set_personal_specimens([])
-            if self.dock:
-                self.dock.personal.refresh()
-            return
-        try:
-            rows = self.personal_store.records_for_object(
-                context["source_system"], context["source_type"],
-                context["source_id"], context.get("gea_id", ""),
-                context.get("sarv_id", ""),
-            )
-        except Exception as error:
-            self.warning(
-                f"Could not read personal data: {error}"
-                if self.language == "en" else
-                f"Isiklike andmete lugemine ebaõnnestus: {error}"
-            )
-            return
-        self.dock.details.set_personal_samples(rows["samples"])
-        self.dock.details.set_personal_analyses(rows["analyses"])
-        self.dock.details.set_personal_specimens(rows["specimens"])
-        self.dock.personal.refresh()
 
     def decode_egt(self, table_id, field, value):
         """Return an official EGT domain label while preserving unknown values."""
@@ -674,6 +505,12 @@ class QeoloogPlugin:
         self.toggle_mode = bool(enabled)
         PluginSettings.save_toggle_mode(self.toggle_mode)
 
+    def set_egt_data_source(self, source):
+        if source not in {"wfs", "api"}:
+            return
+        self.egt_data_source = source
+        PluginSettings.save_egt_data_source(source)
+
     def set_group_enabled(self, group, enabled):
         if group not in GROUPS:
             return
@@ -699,9 +536,6 @@ class QeoloogPlugin:
         self.dock.deleteLater()
         self.dock = None
         self._create_dock(tab_index, visible)
-        if self._personal_context:
-            self.dock.personal.set_context(**self._personal_context)
-            self.refresh_personal_details()
         self._build_actions()
         self._sync_identify_controls(identify_checked)
 
@@ -1910,6 +1744,31 @@ class QeoloogPlugin:
         wants_egt = source in {"both", "egt"}
         wants_sarv = source in {"both", "sarv"}
         related = criteria.get("related", {})
+        stratigraphic_indices = criteria.get("stratigraphic_indices", set())
+        if (
+            wants_egt
+            and stratigraphic_indices
+            and "_egt_stratigraphic_allowed" not in criteria
+        ):
+            self.network.query_stratigraphic_parent_ids(
+                stratigraphic_indices,
+                lambda allowed: self.run_search(
+                    {
+                        **criteria,
+                        "_egt_stratigraphic_allowed": allowed,
+                    },
+                    callback,
+                ),
+                lambda error: callback(
+                    [],
+                    (
+                        f"EGT stratigraphic search failed: {error}"
+                        if self.language == "en" else
+                        f"EGT stratigraafiaotsing ebaõnnestus: {error}"
+                    ),
+                ),
+            )
+            return
         sarv_choices = any(
             value.startswith("sarv:")
             for key in ("sample_type", "sample_purpose", "analysis_method")
@@ -1986,6 +1845,13 @@ class QeoloogPlugin:
                     if self._row_matches_domains(row, analysis_filters)
                 })
             allowed_egt = set.intersection(*groups) if groups else None
+        stratigraphic_allowed = criteria.get("_egt_stratigraphic_allowed")
+        if stratigraphic_allowed is not None:
+            allowed_egt = (
+                set(stratigraphic_allowed)
+                if allowed_egt is None
+                else allowed_egt & set(stratigraphic_allowed)
+            )
 
         text_query = str(criteria.get("text") or "")
         depth_min = criteria.get("depth_min")
@@ -2574,17 +2440,6 @@ class QeoloogPlugin:
         details = self.dock.details
         self.dock.show_details()
         details.show_loading(name, attributes, role)
-        self.set_personal_context(
-            "SARV",
-            {
-                "sarv_localities": "locality",
-                "sarv_sites": "site",
-                "sarv_drillcores": "drillcore",
-            }.get(role, "locality"),
-            attributes.get("sarv_id") or "",
-            sarv_id=attributes.get("sarv_id") or "",
-            name=name,
-        )
 
         def current(callback):
             return lambda payload: callback(payload) if token == self._detail_token else None
@@ -2625,10 +2480,6 @@ class QeoloogPlugin:
                 else entity.get("name")
             ) or entity.get("name") or entity.get("number") or name
             details.show_loading(str(display_name), overview, role)
-            self.set_personal_context(
-                "SARV", overview["source_type"], entity.get("id"),
-                sarv_id=entity.get("id"), name=display_name,
-            )
             details.set_profile([])
             details.set_attachments([])
             details.set_ready(str(display_name))
@@ -2910,14 +2761,6 @@ class QeoloogPlugin:
         details = self.dock.details
         self.dock.show_details()
         details.show_loading(name, attributes, role)
-        self.set_personal_context(
-            "GEA",
-            "borehole" if role == "boreholes" else "observation",
-            global_id,
-            gea_id=attributes.get("gea_id") or "",
-            sarv_id=attributes.get("sarv_id") or "",
-            name=name,
-        )
         safe_id = global_id.replace("'", "''")
         parent_where = f"puurauk_vaatluspunkt_id = '{safe_id}'"
 
@@ -2931,7 +2774,7 @@ class QeoloogPlugin:
                     self.warning((f"Some related data could not be loaded ({label}): {error}" if self.language == "en" else f"Osa seotud andmeid jäi laadimata ({label}): {error}"))
             return handler
 
-        def profile_from_gea(wfs_error):
+        def load_profile_from_api(wfs_error):
             if token != self._detail_token:
                 return
             if role != "boreholes":
@@ -2947,12 +2790,33 @@ class QeoloogPlugin:
                 gea_failed,
             )
 
-        self.network.query_geological_units(
-            role,
-            global_id,
-            current(details.set_profile),
-            profile_from_gea,
-        )
+        def load_profile_from_wfs(api_error):
+            if token != self._detail_token:
+                return
+
+            def wfs_failed(wfs_error):
+                failed(self.t("Läbilõige"))(f"{api_error}; {wfs_error}")
+
+            self.network.query_geological_units(
+                role,
+                global_id,
+                current(details.set_profile),
+                wfs_failed,
+            )
+
+        if self.egt_data_source == "api" and role == "boreholes":
+            self.network.query_borehole_profile(
+                global_id,
+                current(details.set_profile),
+                load_profile_from_wfs,
+            )
+        else:
+            self.network.query_geological_units(
+                role,
+                global_id,
+                current(details.set_profile),
+                load_profile_from_api,
+            )
 
         self._load_sarv_details(
             token, attributes, details, failed, egt_role=role,

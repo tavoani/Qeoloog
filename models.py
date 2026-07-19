@@ -153,7 +153,7 @@ class PluginSettings:
     KEY_LANGUAGE = "language"
     KEY_GROUPS = "groups_json"
     KEY_SARV_MATCHES = "sarv_matches_json"
-    KEY_PERSONAL_GPKG = "personal_gpkg"
+    KEY_EGT_DATA_SOURCE = "egt_data_source"
 
     @classmethod
     def load_layers(cls):
@@ -232,6 +232,20 @@ class PluginSettings:
         QgsSettings().setValue(f"{cls.ORGANIZATION}/{cls.KEY_LANGUAGE}", language)
 
     @classmethod
+    def load_egt_data_source(cls):
+        value = QgsSettings().value(
+            f"{cls.ORGANIZATION}/{cls.KEY_EGT_DATA_SOURCE}", "wfs", type=str,
+        )
+        return value if value in {"wfs", "api"} else "wfs"
+
+    @classmethod
+    def save_egt_data_source(cls, source):
+        if source in {"wfs", "api"}:
+            QgsSettings().setValue(
+                f"{cls.ORGANIZATION}/{cls.KEY_EGT_DATA_SOURCE}", source,
+            )
+
+    @classmethod
     def load_groups(cls):
         raw = QgsSettings().value(f"{cls.ORGANIZATION}/{cls.KEY_GROUPS}", "", type=str)
         try:
@@ -263,16 +277,4 @@ class PluginSettings:
         QgsSettings().setValue(
             f"{cls.ORGANIZATION}/{cls.KEY_SARV_MATCHES}",
             json.dumps(matches, ensure_ascii=False),
-        )
-
-    @classmethod
-    def load_personal_gpkg(cls):
-        return QgsSettings().value(
-            f"{cls.ORGANIZATION}/{cls.KEY_PERSONAL_GPKG}", "", type=str,
-        )
-
-    @classmethod
-    def save_personal_gpkg(cls, path):
-        QgsSettings().setValue(
-            f"{cls.ORGANIZATION}/{cls.KEY_PERSONAL_GPKG}", str(path or ""),
         )

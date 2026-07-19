@@ -12,8 +12,6 @@ from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
@@ -40,7 +38,7 @@ from qgis.PyQt.QtWidgets import (
 
 from .i18n import field_label
 from .models import GROUPS, LayerDefinition
-from .personal import FIELD_DEFINITIONS, read_tabular, suggested_mapping
+from .stratigraphy import STRATIGRAPHIC_INDICES
 
 
 class MultiSelectButton(QToolButton):
@@ -183,6 +181,29 @@ class LayerConfigWidget(QWidget):
         preferences_layout.addLayout(group_row)
         layout.addWidget(preferences)
 
+        egt_source = QGroupBox(t("EGT detailandmete allikas"))
+        egt_source_layout = QFormLayout(egt_source)
+        self.egt_data_source = QComboBox()
+        self.egt_data_source.addItem(t("WFS – kiirem laadimine"), "wfs")
+        self.egt_data_source.addItem(t("API – kiiremini uuenevad andmed"), "api")
+        self.egt_data_source.setCurrentIndex(
+            self.egt_data_source.findData(self.plugin.egt_data_source)
+        )
+        self.egt_data_source.currentIndexChanged.connect(
+            lambda: self.plugin.set_egt_data_source(
+                self.egt_data_source.currentData()
+            )
+        )
+        egt_source_layout.addRow(t("Puuraugud ja vaatluspunktid"), self.egt_data_source)
+        egt_note = QLabel(t(
+            "API valik kasutab puuraukudel GEA API-t. Vaatluspunktide "
+            "detailandmeid avalik GEA API praegu ei paku, seega kasutatakse "
+            "nende puhul WFS-i."
+        ))
+        egt_note.setWordWrap(True)
+        egt_source_layout.addRow(egt_note)
+        layout.addWidget(egt_source)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(splitter)
 
@@ -271,8 +292,21 @@ class LayerConfigWidget(QWidget):
         self.toggle_mode.setChecked(self.plugin.toggle_mode)
         self.toggle_mode.toggled.connect(self.plugin.set_toggle_mode)
         form_host_layout.addWidget(self.toggle_mode)
+        export_button = QPushButton(t("Ekspordi SARV seosed…"))
+        export_button.clicked.connect(self._export_sarv_matches)
+        form_host_layout.addWidget(export_button)
         splitter.addWidget(form_host)
         splitter.setSizes([220, 360])
+
+    def _export_sarv_matches(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.plugin.t("Ekspordi SARV seosed"),
+            "qeoloog_sarv_seosed.csv",
+            "CSV (*.csv);;JSON (*.json)",
+        )
+        if path:
+            self.plugin.export_sarv_matches(path)
 
     def reload_list(self, select=None):
         self.list_widget.blockSignals(True)
@@ -480,575 +514,6 @@ class LayerConfigWidget(QWidget):
         if answer == QMessageBox.StandardButton.Yes:
             self.plugin.reset_definitions()
             self.reload_list(0)
-
-
-class LabImportDialog(QDialog):
-    """Preview a laboratory table and explicitly map its columns."""
-
-    def __init__(self, plugin, source_path, headers, rows, parent=None):
-        super().__init__(parent)
-        self.plugin = plugin
-        self.source_path = source_path
-        self.headers = list(headers)
-        self.rows = list(rows)
-        self.setWindowTitle(
-            "Laboratory data import" if plugin.language == "en"
-            else "Laboriandmete import"
-        )
-        self.resize(940, 720)
-        layout = QVBoxLayout(self)
-        explanation = QLabel(
-            (
-                "Review the preview and map the laboratory columns. "
-                "Sample number, parameter and result value are required."
-                if plugin.language == "en" else
-                "Kontrolli eelvaadet ja seo labori veerud. "
-                "Proovi tähis, näitaja ja tulemuse väärtus on kohustuslikud."
-            )
-        )
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
-
-        preview = QTableWidget(min(20, len(rows)), len(headers))
-        preview.setHorizontalHeaderLabels(headers)
-        preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        for row_index, row in enumerate(rows[:20]):
-            for column_index, header in enumerate(headers):
-                preview.setItem(
-                    row_index, column_index,
-                    QTableWidgetItem(str(row.get(header, ""))),
-                )
-        preview.resizeColumnsToContents()
-        layout.addWidget(preview, 1)
-
-        mapping_host = QWidget()
-        mapping_layout = QFormLayout(mapping_host)
-        self.mapping_choices = {}
-        suggestions = suggested_mapping(headers)
-        self.mode = QComboBox()
-        self.mode.addItem(
-            "Long: one result per row" if plugin.language == "en"
-            else "Pikk: üks tulemus real",
-            "long",
-        )
-        self.mode.addItem(
-            "Wide: parameters in separate columns" if plugin.language == "en"
-            else "Lai: näitajad eraldi veergudes",
-            "wide",
-        )
-        if not suggestions.get("parameter") or not suggestions.get("value"):
-            self.mode.setCurrentIndex(1)
-        mapping_layout.addRow(
-            "Table layout" if plugin.language == "en" else "Tabeli kuju",
-            self.mode,
-        )
-        self.wide_parameters = MultiSelectButton(
-            "Choose result columns" if plugin.language == "en"
-            else "Vali tulemuste veerud"
-        )
-        self.wide_parameters.set_options((header, header) for header in headers)
-        mapping_layout.addRow(
-            "Result columns" if plugin.language == "en" else "Tulemuste veerud",
-            self.wide_parameters,
-        )
-        for field, english_label, required in FIELD_DEFINITIONS:
-            label = self._field_label(field, english_label)
-            if required:
-                label += " *"
-            choice = QComboBox()
-            choice.addItem("—", "")
-            for header in headers:
-                choice.addItem(header, header)
-            suggested = suggestions.get(field)
-            if suggested:
-                choice.setCurrentIndex(choice.findData(suggested))
-            self.mapping_choices[field] = choice
-            mapping_layout.addRow(label, choice)
-        if self.mode.currentData() == "wide":
-            excluded = set(suggestions.values())
-            numeric_headers = []
-            for header in headers:
-                if header in excluded:
-                    continue
-                present = [
-                    row.get(header) for row in rows[:50]
-                    if str(row.get(header, "")).strip()
-                ]
-                if not present:
-                    continue
-                numeric = 0
-                for value in present:
-                    try:
-                        float(str(value).strip().replace(",", "."))
-                        numeric += 1
-                    except ValueError:
-                        pass
-                if numeric / len(present) >= 0.7:
-                    numeric_headers.append(header)
-            self.wide_parameters.set_selected_values(numeric_headers)
-        self.mode.currentIndexChanged.connect(self._mode_changed)
-        self._mode_changed()
-        mapping_scroll = QScrollArea()
-        mapping_scroll.setWidgetResizable(True)
-        mapping_scroll.setMinimumHeight(260)
-        mapping_scroll.setWidget(mapping_host)
-        layout.addWidget(mapping_scroll)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Ok
-        )
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _field_label(self, field, english):
-        if self.plugin.language == "en":
-            return english
-        return {
-            "sample_number": "Proovi tähis",
-            "parameter": "Näitaja",
-            "value": "Tulemuse väärtus",
-            "analysis_code": "Analüüsi kood",
-            "specimen_number": "Eksemplari / pala tähis",
-            "sample_type": "Proovi tüüp",
-            "purpose": "Proovi eesmärk",
-            "status": "Proovi staatus",
-            "depth_from": "Sügavus alates",
-            "depth_to": "Sügavus kuni",
-            "unit": "Ühik",
-            "method": "Analüüsi meetod",
-            "lab": "Labor",
-            "lab_number": "Labori number",
-            "date": "Analüüsi kuupäev",
-            "qualifier": "Tulemuse tunnus",
-            "detection_limit": "Määramispiir",
-            "uncertainty": "Määramatus",
-            "remarks": "Märkus",
-        }.get(field, english)
-
-    def _accept(self):
-        mapping = self.mapping()
-        wide = self.mode.currentData() == "wide"
-        missing = [
-            self._field_label(field, label)
-            for field, label, required in FIELD_DEFINITIONS
-            if required and not mapping.get(field)
-            and not (wide and field in {"parameter", "value"})
-        ]
-        if wide and not mapping.get("wide_parameters"):
-            missing.append(
-                "Result columns" if self.plugin.language == "en"
-                else "Tulemuste veerud"
-            )
-        if missing:
-            QMessageBox.warning(
-                self, "Qeoloog",
-                (
-                    "Map the required fields: " if self.plugin.language == "en"
-                    else "Seo kohustuslikud väljad: "
-                ) + ", ".join(missing),
-            )
-            return
-        self.accept()
-
-    def mapping(self):
-        mapping = {
-            field: choice.currentData()
-            for field, choice in self.mapping_choices.items()
-            if choice.currentData()
-        }
-        if self.mode.currentData() == "wide":
-            mapping["wide_parameters"] = sorted(
-                self.wide_parameters.selected_values()
-            )
-        return mapping
-
-    def _mode_changed(self):
-        wide = self.mode.currentData() == "wide"
-        self.wide_parameters.setEnabled(wide)
-        for field in ("parameter", "value"):
-            self.mapping_choices[field].setEnabled(not wide)
-
-
-class PersonalDataWidget(QWidget):
-    """Manage the local GeoPackage and its import/export workflows."""
-
-    def __init__(self, plugin):
-        super().__init__()
-        self.plugin = plugin
-        self._lookup_generation = 0
-        self._build_ui()
-        self.refresh()
-
-    def _build_ui(self):
-        t = self.plugin.t
-        layout = QVBoxLayout(self)
-
-        workspace = QGroupBox(
-            "Personal GeoPackage" if self.plugin.language == "en"
-            else "Isiklik GeoPackage"
-        )
-        workspace_layout = QVBoxLayout(workspace)
-        self.path = QLineEdit()
-        self.path.setReadOnly(True)
-        workspace_layout.addWidget(self.path)
-        path_buttons = QHBoxLayout()
-        create_button = QPushButton(t("Uus"))
-        create_button.clicked.connect(self._create)
-        open_button = QPushButton(t("Vali..."))
-        open_button.clicked.connect(self._open)
-        path_buttons.addWidget(create_button)
-        path_buttons.addWidget(open_button)
-        workspace_layout.addLayout(path_buttons)
-        self.summary = QLabel()
-        self.summary.setWordWrap(True)
-        workspace_layout.addWidget(self.summary)
-        layout.addWidget(workspace)
-
-        target = QGroupBox(
-            "Import target object" if self.plugin.language == "en"
-            else "Impordi sihtobjekt"
-        )
-        target_layout = QFormLayout(target)
-        self.source_system = QComboBox()
-        self.source_system.addItem("GEA", "GEA")
-        self.source_system.addItem("SARV", "SARV")
-        self.source_type = QComboBox()
-        self.source_system.currentIndexChanged.connect(self._source_changed)
-        self._reload_source_types()
-        self.source_id = QLineEdit()
-        self.gea_id = QLineEdit()
-        self.sarv_id = QLineEdit()
-        self.object_name = QLineEdit()
-        target_layout.addRow(t("Allikas"), self.source_system)
-        target_layout.addRow(
-            "Object type" if self.plugin.language == "en" else "Objekti tüüp",
-            self.source_type,
-        )
-        target_layout.addRow("Source ID" if self.plugin.language == "en" else "Allika ID", self.source_id)
-        target_layout.addRow("GEA ID", self.gea_id)
-        target_layout.addRow("SARV ID", self.sarv_id)
-        target_layout.addRow(t("Nimi"), self.object_name)
-        lookup_button = QPushButton(
-            "Fill from ID" if self.plugin.language == "en"
-            else "Täida ID põhjal"
-        )
-        lookup_button.clicked.connect(self._lookup_target)
-        self.lookup_button = lookup_button
-        target_layout.addRow("", lookup_button)
-        self.lookup_status = QLabel()
-        self.lookup_status.setWordWrap(True)
-        target_layout.addRow("", self.lookup_status)
-        self.gea_id.editingFinished.connect(self._lookup_if_ready)
-        self.sarv_id.editingFinished.connect(self._lookup_if_ready)
-        layout.addWidget(target)
-
-        import_group = QGroupBox(
-            "Laboratory import" if self.plugin.language == "en"
-            else "Laboriandmete import"
-        )
-        import_layout = QVBoxLayout(import_group)
-        import_note = QLabel(
-            (
-                "CSV, TSV and XLSX (first worksheet). A preview and explicit "
-                "column mapping are shown before the data is written."
-                if self.plugin.language == "en" else
-                "CSV, TSV ja XLSX (esimene tööleht). Enne kirjutamist kuvatakse "
-                "eelvaade ja veergude sidumise vorm."
-            )
-        )
-        import_note.setWordWrap(True)
-        import_layout.addWidget(import_note)
-        import_button = QPushButton(
-            "Import laboratory CSV/XLSX…" if self.plugin.language == "en"
-            else "Impordi labori CSV/XLSX…"
-        )
-        import_button.clicked.connect(self._import)
-        import_layout.addWidget(import_button)
-        layout.addWidget(import_group)
-
-        export_group = QGroupBox(t("Eksport"))
-        export_layout = QVBoxLayout(export_group)
-        gea_button = QPushButton(
-            "Export GEA converter package…" if self.plugin.language == "en"
-            else "Ekspordi GEA konverteripakett…"
-        )
-        gea_button.clicked.connect(lambda: self._export("gea"))
-        sarv_button = QPushButton(
-            "Export SARV converter package…" if self.plugin.language == "en"
-            else "Ekspordi SARV konverteripakett…"
-        )
-        sarv_button.clicked.connect(lambda: self._export("sarv"))
-        matches_button = QPushButton(t("Ekspordi SARV seosed…"))
-        matches_button.clicked.connect(self._export_sarv_matches)
-        export_layout.addWidget(gea_button)
-        export_layout.addWidget(sarv_button)
-        export_layout.addWidget(matches_button)
-        export_note = QLabel(
-            (
-                "The converter packages are staging exports. Validate target "
-                "database vocabularies and identifiers before import."
-                if self.plugin.language == "en" else
-                "Konverteripaketid on vaheformaadid. Enne sihtbaasi importi tuleb "
-                "kontrollida klassifikaatorid ja objektide ID-d."
-            )
-        )
-        export_note.setWordWrap(True)
-        export_layout.addWidget(export_note)
-        layout.addWidget(export_group)
-        layout.addStretch(1)
-
-    def _source_changed(self):
-        self._lookup_generation += 1
-        self.lookup_button.setEnabled(True)
-        self._reload_source_types()
-        self.source_id.clear()
-        self.gea_id.clear()
-        self.sarv_id.clear()
-        self.object_name.clear()
-        self.lookup_status.clear()
-
-    def _reload_source_types(self):
-        current = self.source_type.currentData()
-        self.source_type.blockSignals(True)
-        self.source_type.clear()
-        if self.source_system.currentData() == "SARV":
-            options = (
-                (self.plugin.t("Lokaliteet"), "locality"),
-                (self.plugin.t("Uuringupunkt"), "site"),
-                (self.plugin.t("Puursüdamik"), "drillcore"),
-            )
-        else:
-            options = (
-                (self.plugin.t("Puurauk"), "borehole"),
-                (self.plugin.t("Vaatluspunkt"), "observation"),
-            )
-        for label, value in options:
-            self.source_type.addItem(label, value)
-        index = self.source_type.findData(current)
-        self.source_type.setCurrentIndex(index if index >= 0 else 0)
-        self.source_type.blockSignals(False)
-
-    def _lookup_if_ready(self):
-        if self.source_system.currentData() == "GEA":
-            ready = bool(self.gea_id.text().strip())
-        else:
-            ready = bool(self.sarv_id.text().strip())
-        if ready:
-            self._lookup_target()
-
-    def _lookup_target(self):
-        source_system = self.source_system.currentData()
-        external_id = (
-            self.gea_id.text().strip()
-            if source_system == "GEA"
-            else self.sarv_id.text().strip()
-        )
-        if not external_id:
-            self.lookup_status.setText(
-                "Enter an ID first." if self.plugin.language == "en"
-                else "Sisesta esmalt ID."
-            )
-            return
-        self._lookup_generation += 1
-        generation = self._lookup_generation
-        self.lookup_button.setEnabled(False)
-        self.lookup_status.setStyleSheet("")
-        self.lookup_status.setText(
-            "Looking up object…" if self.plugin.language == "en"
-            else "Objekti otsitakse…"
-        )
-
-        def loaded(values):
-            if generation != self._lookup_generation:
-                return
-            self.lookup_button.setEnabled(True)
-            self.set_context(**values)
-            self.lookup_status.setStyleSheet("color: #2f7d32;")
-            self.lookup_status.setText(
-                "Object details filled from the source."
-                if self.plugin.language == "en" else
-                "Objekti andmed täideti allikast."
-            )
-
-        def failed(error):
-            if generation != self._lookup_generation:
-                return
-            self.lookup_button.setEnabled(True)
-            self.lookup_status.setStyleSheet("color: #a33a32;")
-            self.lookup_status.setText(str(error))
-
-        self.plugin.lookup_personal_target(
-            source_system, self.source_type.currentData(), external_id,
-            loaded, failed,
-        )
-
-    def refresh(self):
-        store = self.plugin.personal_store
-        self.path.setText(str(store.path) if store.path else "")
-        counts = store.counts()
-        if not counts:
-            self.summary.setText(
-                "No personal GeoPackage is open."
-                if self.plugin.language == "en" else
-                "Isiklik GeoPackage ei ole avatud."
-            )
-            return
-        self.summary.setText(
-            (
-                f"Links {counts['qeoloog_object_links']}, samples "
-                f"{counts['qeoloog_samples']}, specimens "
-                f"{counts['qeoloog_specimens']}, analyses "
-                f"{counts['qeoloog_analyses']}, results "
-                f"{counts['qeoloog_analysis_results']}."
-                if self.plugin.language == "en" else
-                f"Seoseid {counts['qeoloog_object_links']}, proove "
-                f"{counts['qeoloog_samples']}, eksemplare "
-                f"{counts['qeoloog_specimens']}, analüüse "
-                f"{counts['qeoloog_analyses']}, tulemusi "
-                f"{counts['qeoloog_analysis_results']}."
-            )
-        )
-
-    def set_context(
-        self, source_system, source_type, source_id, gea_id="", sarv_id="", name="",
-    ):
-        self.source_system.setCurrentIndex(
-            max(0, self.source_system.findData(source_system))
-        )
-        self.source_type.setCurrentIndex(
-            max(0, self.source_type.findData(source_type))
-        )
-        self.source_id.setText(str(source_id or ""))
-        self.gea_id.setText(str(gea_id or ""))
-        self.sarv_id.setText(str(sarv_id or ""))
-        self.object_name.setText(str(name or ""))
-
-    def _create(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Qeoloog", "qeoloog_isiklik.gpkg",
-            "GeoPackage (*.gpkg)",
-        )
-        if path:
-            self.plugin.create_personal_workspace(path)
-            self.refresh()
-
-    def _open(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Qeoloog", "", "GeoPackage (*.gpkg)",
-        )
-        if path:
-            self.plugin.open_personal_workspace(path)
-            self.refresh()
-
-    def _link(self):
-        source_id = self.source_id.text().strip()
-        if not source_id:
-            raise ValueError(
-                "Source object ID is required."
-                if self.plugin.language == "en" else
-                "Allika objekti ID on kohustuslik."
-            )
-        return {
-            "source_system": self.source_system.currentData(),
-            "source_type": self.source_type.currentData(),
-            "source_id": source_id,
-            "gea_id": self.gea_id.text().strip(),
-            "sarv_id": self.sarv_id.text().strip(),
-            "name": self.object_name.text().strip(),
-        }
-
-    def _import(self):
-        if not self.plugin.personal_store.is_open:
-            QMessageBox.warning(
-                self, "Qeoloog",
-                "Open or create a personal GeoPackage first."
-                if self.plugin.language == "en" else
-                "Ava või loo esmalt isiklik GeoPackage.",
-            )
-            return
-        try:
-            link = self._link()
-        except ValueError as error:
-            QMessageBox.warning(self, "Qeoloog", str(error))
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Qeoloog", "",
-            "Laboratory data (*.csv *.tsv *.txt *.xlsx);;CSV (*.csv);;Excel (*.xlsx)",
-        )
-        if not path:
-            return
-        try:
-            headers, rows = read_tabular(path)
-            if not headers or not rows:
-                raise ValueError(
-                    "The selected file contains no data rows."
-                    if self.plugin.language == "en" else
-                    "Valitud failis ei ole andmeridu."
-                )
-            dialog = LabImportDialog(self.plugin, path, headers, rows, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            result = self.plugin.personal_store.import_lab_rows(
-                path, rows, dialog.mapping(), link,
-            )
-        except Exception as error:
-            QMessageBox.critical(self, "Qeoloog", str(error))
-            return
-        warning_count = len(result["warnings"])
-        self.plugin.success(
-            (
-                f"Imported {result['imported']} rows; warnings: {warning_count}."
-                if self.plugin.language == "en" else
-                f"Imporditi {result['imported']} rida; hoiatusi: {warning_count}."
-            )
-        )
-        if result["warnings"]:
-            QMessageBox.warning(
-                self, "Qeoloog",
-                "\n".join(result["warnings"][:30]),
-            )
-        self.refresh()
-        self.plugin.refresh_personal_details()
-
-    def _export(self, target):
-        if not self.plugin.personal_store.is_open:
-            QMessageBox.warning(
-                self, "Qeoloog",
-                "Open or create a personal GeoPackage first."
-                if self.plugin.language == "en" else
-                "Ava või loo esmalt isiklik GeoPackage.",
-            )
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Qeoloog", f"qeoloog_{target}_eksport.zip", "ZIP (*.zip)",
-        )
-        if not path:
-            return
-        try:
-            output, warnings = self.plugin.personal_store.export(path, target)
-        except Exception as error:
-            QMessageBox.critical(self, "Qeoloog", str(error))
-            return
-        self.plugin.success(
-            (
-                f"Exported {target.upper()} package to {output}; "
-                f"validation warnings: {len(warnings)}."
-                if self.plugin.language == "en" else
-                f"{target.upper()} pakett eksporditi faili {output}; "
-                f"valideerimishoiatusi: {len(warnings)}."
-            )
-        )
-
-    def _export_sarv_matches(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, self.plugin.t("Ekspordi SARV seosed"),
-            "qeoloog_sarv_seosed.csv",
-            "CSV (*.csv);;JSON (*.json)",
-        )
-        if path:
-            self.plugin.export_sarv_matches(path)
 
 
 class FilterWidget(QWidget):
@@ -1387,6 +852,11 @@ class SearchWidget(QWidget):
         depth_layout.addWidget(self.depth_min)
         depth_layout.addWidget(self.depth_max)
         form.addRow(t("Sügavus"), depth_host)
+        self.stratigraphic_index = MultiSelectButton(t("Kõik"))
+        self.stratigraphic_index.set_options(
+            (index, index) for index in STRATIGRAPHIC_INDICES
+        )
+        form.addRow(t("Indeks"), self.stratigraphic_index)
         self.sample_type = MultiSelectButton(t("Kõik"))
         self.sample_purpose = MultiSelectButton(t("Kõik"))
         self.analysis_method = MultiSelectButton(t("Kõik"))
@@ -1426,7 +896,14 @@ class SearchWidget(QWidget):
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         layout.addWidget(self.results)
+        self.source.currentIndexChanged.connect(self._source_changed)
+        self._source_changed()
         self.reload_domain_options()
+
+    def _source_changed(self):
+        self.stratigraphic_index.setEnabled(
+            self.source.currentData() in {"both", "egt"}
+        )
 
     def reload_domain_options(self):
         egt_types = self.plugin.egt_options(18, "proov_tyyp")
@@ -1465,6 +942,10 @@ class SearchWidget(QWidget):
             "current_extent": self.current_extent.isChecked(),
             "depth_min": number(self.depth_min),
             "depth_max": number(self.depth_max),
+            "stratigraphic_indices": (
+                self.stratigraphic_index.selected_values()
+                if self.stratigraphic_index.isEnabled() else set()
+            ),
             "sample_type": self.sample_type.selected_values(),
             "sample_purpose": self.sample_purpose.selected_values(),
             "analysis_method": self.analysis_method.selected_values(),
@@ -1691,9 +1172,6 @@ class ProfileWidget(QWidget):
         self.sarv_samples = []
         self.sarv_analyses = []
         self.sarv_specimens = []
-        self.personal_samples = []
-        self.personal_analyses = []
-        self.personal_specimens = []
         self.core_images = {}
         self.sarv_core_images = {}
         self._click_targets = []
@@ -1707,13 +1185,10 @@ class ProfileWidget(QWidget):
         self.show_sarv_samples = True
         self.show_sarv_analyses = True
         self.show_sarv_specimens = True
-        self.show_personal_samples = True
-        self.show_personal_analyses = True
-        self.show_personal_specimens = True
         self.group_sarv_overlaps = True
         self.core_applicable = False
         self.zoom_factor = 1.0
-        self.setMinimumWidth(940)
+        self.setMinimumWidth(720)
         self.setMouseTracking(True)
         self._update_minimum_height()
 
@@ -1752,18 +1227,6 @@ class ProfileWidget(QWidget):
         self.sarv_specimens = list(rows)
         self._update_minimum_height()
 
-    def set_personal_samples(self, rows):
-        self.personal_samples = list(rows)
-        self._update_minimum_height()
-
-    def set_personal_analyses(self, rows):
-        self.personal_analyses = list(rows)
-        self._update_minimum_height()
-
-    def set_personal_specimens(self, rows):
-        self.personal_specimens = list(rows)
-        self._update_minimum_height()
-
     def set_core_images(self, images_by_core):
         self.core_images = {
             str(key).upper(): list(value) for key, value in images_by_core.items()
@@ -1796,9 +1259,6 @@ class ProfileWidget(QWidget):
         sarv_analyses=None,
         sarv_specimens=None,
         sarv_grouping=None,
-        personal_samples=None,
-        personal_analyses=None,
-        personal_specimens=None,
     ):
         if lithology is not None:
             self.show_lithology = lithology
@@ -1818,12 +1278,6 @@ class ProfileWidget(QWidget):
             self.show_sarv_analyses = sarv_analyses
         if sarv_specimens is not None:
             self.show_sarv_specimens = sarv_specimens
-        if personal_samples is not None:
-            self.show_personal_samples = personal_samples
-        if personal_analyses is not None:
-            self.show_personal_analyses = personal_analyses
-        if personal_specimens is not None:
-            self.show_personal_specimens = personal_specimens
         if sarv_grouping is not None:
             self.group_sarv_overlaps = sarv_grouping
         self._update_minimum_height()
@@ -1861,12 +1315,6 @@ class ProfileWidget(QWidget):
             rows.extend(self.sarv_analyses)
         if self.show_sarv_specimens:
             rows.extend(self.sarv_specimens)
-        if self.show_personal_samples:
-            rows.extend(self.personal_samples)
-        if self.show_personal_analyses:
-            rows.extend(self.personal_analyses)
-        if self.show_personal_specimens:
-            rows.extend(self.personal_specimens)
         return rows
 
     def _max_depth(self):
@@ -1938,10 +1386,7 @@ class ProfileWidget(QWidget):
         sarv_sample_left = analysis_left + 20
         sarv_analysis_left = sarv_sample_left + self.SARV_TRACK_WIDTH + 8
         sarv_specimen_left = sarv_analysis_left + self.SARV_TRACK_WIDTH + 8
-        personal_sample_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 8
-        personal_analysis_left = personal_sample_left + self.SARV_TRACK_WIDTH + 8
-        personal_specimen_left = personal_analysis_left + self.SARV_TRACK_WIDTH + 8
-        lithology_left = personal_specimen_left + self.SARV_TRACK_WIDTH + 14
+        lithology_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 14
 
         def depth_y(depth):
             return self.TOP_MARGIN + draw_height * depth / max_depth
@@ -1965,15 +1410,6 @@ class ProfileWidget(QWidget):
         painter.setPen(QColor("#b23a62"))
         if self.show_sarv_specimens:
             painter.drawText(sarv_specimen_left + 14, 34, "SE")
-        painter.setPen(QColor("#5968a8"))
-        if self.show_personal_samples:
-            painter.drawText(personal_sample_left + 14, 34, "IP")
-        painter.setPen(QColor("#8055a6"))
-        if self.show_personal_analyses:
-            painter.drawText(personal_analysis_left + 14, 34, "IA")
-        painter.setPen(QColor("#9a5262"))
-        if self.show_personal_specimens:
-            painter.drawText(personal_specimen_left + 14, 34, "IE")
         painter.setPen(QColor("#555555"))
         if self.show_core_boxes:
             painter.drawText(bar_left, 20, self.plugin.t("Kastipiirid"))
@@ -2105,25 +1541,6 @@ class ProfileWidget(QWidget):
                 painter, self.sarv_specimens, sarv_specimen_left, QColor("#b23a62"),
                 self.TOP_MARGIN, draw_height, max_depth, sarv=True,
             )
-        if self.show_personal_samples:
-            self._draw_intervals(
-                painter, self.personal_samples, personal_sample_left,
-                QColor("#5968a8"), self.TOP_MARGIN, draw_height, max_depth,
-                sarv=True,
-            )
-        if self.show_personal_analyses:
-            self._draw_intervals(
-                painter, self.personal_analyses, personal_analysis_left,
-                QColor("#8055a6"), self.TOP_MARGIN, draw_height, max_depth,
-                sarv=True,
-            )
-        if self.show_personal_specimens:
-            self._draw_intervals(
-                painter, self.personal_specimens, personal_specimen_left,
-                QColor("#9a5262"), self.TOP_MARGIN, draw_height, max_depth,
-                sarv=True,
-            )
-
     def _draw_boundary_depth_labels(
         self, painter, depth_y, max_depth, bar_left, draw_height,
     ):
@@ -2396,20 +1813,6 @@ class DetailWidget(QWidget):
             sarv_controls.addWidget(checkbox)
         sarv_controls.addStretch(1)
         profile_layout.addLayout(sarv_controls)
-        personal_controls = QHBoxLayout()
-        personal_controls.addWidget(QLabel(f"{t('MINU')}:"))
-        self.profile_personal_samples = QCheckBox(t("Proovid"))
-        self.profile_personal_analyses = QCheckBox(t("Analüüsid"))
-        self.profile_personal_specimens = QCheckBox(t("Eksemplarid"))
-        for checkbox in (
-            self.profile_personal_samples,
-            self.profile_personal_analyses,
-            self.profile_personal_specimens,
-        ):
-            checkbox.setChecked(True)
-            personal_controls.addWidget(checkbox)
-        personal_controls.addStretch(1)
-        profile_layout.addLayout(personal_controls)
         profile_scroll = QScrollArea()
         profile_scroll.setWidgetResizable(True)
         profile_scroll.setWidget(self.profile)
@@ -2445,15 +1848,6 @@ class DetailWidget(QWidget):
         self.profile_sarv_grouping.toggled.connect(
             lambda checked: self.profile.set_options(sarv_grouping=checked)
         )
-        self.profile_personal_samples.toggled.connect(
-            lambda checked: self.profile.set_options(personal_samples=checked)
-        )
-        self.profile_personal_analyses.toggled.connect(
-            lambda checked: self.profile.set_options(personal_analyses=checked)
-        )
-        self.profile_personal_specimens.toggled.connect(
-            lambda checked: self.profile.set_options(personal_specimens=checked)
-        )
         core_page, self.core, self.core_sources = self._source_page(
             (
                 t("Allikas"), t("Kast"), t("Ülemine"), t("Alumine"),
@@ -2464,7 +1858,7 @@ class DetailWidget(QWidget):
         self.tabs.addTab(core_page, t("Puursüdamik"))
         samples_page, self.samples, self.sample_sources = self._source_page(
             (t("Allikas"), t("Tähis"), t("Tüüp"), t("Ülemine"), t("Alumine"), t("Eesmärk"), t("Staatus")),
-            ("EGT", "SARV", t("MINU")),
+            ("EGT", "SARV"),
         )
         self.tabs.addTab(samples_page, t("Proovid"))
         analyses_page, self.analyses, self.analysis_sources = self._source_page(
@@ -2472,12 +1866,12 @@ class DetailWidget(QWidget):
                 t("Allikas"), t("Kood"), t("Sügavus"), t("Kuupäev"),
                 t("Meetod"), t("Labor"), t("Näitajad"),
             ),
-            ("EGT", "SARV", t("MINU")),
+            ("EGT", "SARV"),
         )
         self.tabs.addTab(analyses_page, t("Analüüsid"))
         specimens_page, self.specimens, self.specimen_sources = self._source_page(
             (t("Allikas"), t("Tähis"), t("Tüüp"), t("Sügavus"), t("Intervall"), t("Kivim")),
-            ("SARV", t("MINU")),
+            ("SARV",),
         )
         self.tabs.addTab(specimens_page, t("Eksemplarid"))
         self.attachments = self._table((t("Tüüp"), t("Fail"), t("Link")))
@@ -2494,13 +1888,10 @@ class DetailWidget(QWidget):
         self._sarv_core_images = {}
         self._egt_samples = []
         self._sarv_samples = []
-        self._personal_samples = []
         self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
-        self._personal_analyses = []
         self._sarv_specimens = []
-        self._personal_specimens = []
         self._sarv_literature = []
         self._sarv_analysis_refs = {"sample": [], "specimen": []}
         self._overview_has_sarv_id = False
@@ -2570,22 +1961,16 @@ class DetailWidget(QWidget):
         self.profile.set_sarv_samples([])
         self.profile.set_sarv_analyses([])
         self.profile.set_sarv_specimens([])
-        self.profile.set_personal_samples([])
-        self.profile.set_personal_analyses([])
-        self.profile.set_personal_specimens([])
         self._core_rows = []
         self._egt_core_images = {}
         self._sarv_core_rows = []
         self._sarv_core_images = {}
         self._egt_samples = []
         self._sarv_samples = []
-        self._personal_samples = []
         self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
-        self._personal_analyses = []
         self._sarv_specimens = []
-        self._personal_specimens = []
         self._sarv_literature = []
         self._sarv_analysis_refs = {"sample": [], "specimen": []}
         for table in (
@@ -2879,14 +2264,6 @@ class DetailWidget(QWidget):
         ])
         self._refresh_samples()
 
-    def set_personal_samples(self, rows):
-        self._personal_samples = list(rows)
-        self.profile.set_personal_samples([
-            track for row in rows
-            if (track := _personal_track(row, "sample")) is not None
-        ])
-        self._refresh_samples()
-
     def _refresh_samples(self):
         values = []
         if self.sample_sources["EGT"].isChecked():
@@ -2918,24 +2295,11 @@ class DetailWidget(QWidget):
                 )
                 for row in self._sarv_samples
             )
-        personal_key = self.plugin.t("MINU")
-        if self.sample_sources[personal_key].isChecked():
-            values.extend(
-                (
-                    personal_key,
-                    row.get("number"),
-                    row.get("sample_type"),
-                    row.get("depth_from"),
-                    row.get("depth_to"),
-                    row.get("purpose"),
-                    row.get("status"),
-                )
-                for row in self._personal_samples
-            )
         self._fill_rows(self.samples, values)
         self.tabs.setTabText(
-            3, f"{self.plugin.t('Proovid')} "
-            f"({len(self._egt_samples) + len(self._sarv_samples) + len(self._personal_samples)})"
+            3,
+            f"{self.plugin.t('Proovid')} "
+            f"({len(self._egt_samples) + len(self._sarv_samples)})",
         )
 
     def set_analyses(self, rows, results_by_analysis=None):
@@ -2955,14 +2319,6 @@ class DetailWidget(QWidget):
         ]
         self._refresh_analyses()
         self._refresh_literature()
-
-    def set_personal_analyses(self, rows):
-        self._personal_analyses = list(rows)
-        self.profile.set_personal_analyses([
-            track for row in rows
-            if (track := _personal_track(row, "analysis")) is not None
-        ])
-        self._refresh_analyses()
 
     def _refresh_analyses(self):
         values = []
@@ -2998,42 +2354,11 @@ class DetailWidget(QWidget):
                     lab,
                     row.get("material") or row.get("remarks"),
                 ))
-        personal_key = self.plugin.t("MINU")
-        if self.analysis_sources[personal_key].isChecked():
-            for row in self._personal_analyses:
-                indicators = ", ".join(
-                    (
-                        f"{result.get('parameter')}: "
-                        f"{result.get('value_num') if result.get('value_num') is not None else result.get('value_text')}"
-                        f" {result.get('unit') or ''}"
-                    ).strip()
-                    for result in row.get("results", [])
-                )
-                depths = [
-                    result for result in row.get("results", [])
-                    if result.get("depth_from") is not None
-                    or result.get("depth_to") is not None
-                ]
-                depth_text = ""
-                if depths:
-                    top = next((
-                        result.get("depth_from") for result in depths
-                        if result.get("depth_from") is not None
-                    ), "")
-                    bottom = next((
-                        result.get("depth_to") for result in reversed(depths)
-                        if result.get("depth_to") is not None
-                    ), top)
-                    depth_text = f"{top}–{bottom} m"
-                values.append((
-                    personal_key, row.get("code") or row.get("lab_number"),
-                    depth_text, row.get("analysis_date"), row.get("method"),
-                    row.get("lab"), indicators,
-                ))
         self._fill_rows(self.analyses, values)
         self.tabs.setTabText(
-            4, f"{self.plugin.t('Analüüsid')} "
-            f"({len(egt_rows) + len(sarv_rows) + len(self._personal_analyses)})"
+            4,
+            f"{self.plugin.t('Analüüsid')} "
+            f"({len(egt_rows) + len(sarv_rows)})",
         )
 
     def refresh_decoded_values(self):
@@ -3046,14 +2371,6 @@ class DetailWidget(QWidget):
         self.profile.set_sarv_specimens([
             track for row in rows
             if (track := _sarv_track(row, "specimen")) is not None
-        ])
-        self._refresh_specimens()
-
-    def set_personal_specimens(self, rows):
-        self._personal_specimens = list(rows)
-        self.profile.set_personal_specimens([
-            track for row in rows
-            if (track := _personal_track(row, "specimen")) is not None
         ])
         self._refresh_specimens()
 
@@ -3075,20 +2392,10 @@ class DetailWidget(QWidget):
                 )
                 for row in self._sarv_specimens
             ]
-        personal_key = self.plugin.t("MINU")
-        if self.specimen_sources[personal_key].isChecked():
-            values.extend(
-                (
-                    personal_key, row.get("number"), row.get("specimen_type"),
-                    row.get("depth_from"), row.get("depth_to"),
-                    row.get("rock") or row.get("stratigraphy"),
-                )
-                for row in self._personal_specimens
-            )
         self._fill_rows(self.specimens, values)
         self.tabs.setTabText(
-            5, f"{self.plugin.t('Eksemplarid')} "
-            f"({len(self._sarv_specimens) + len(self._personal_specimens)})"
+            5,
+            f"{self.plugin.t('Eksemplarid')} ({len(self._sarv_specimens)})",
         )
 
     def set_attachments(self, rows):
@@ -3215,17 +2522,14 @@ class QeoloogDock(QDockWidget):
         self.filters = FilterWidget(plugin)
         self.sarv_filters = SarvFilterWidget(plugin)
         self.search = SearchWidget(plugin)
-        self.personal = PersonalDataWidget(plugin)
         self.details = DetailWidget(plugin)
         self.tabs.addTab(self.layers, plugin.t("Kihid"))
         self.filter_page = self._scroll(self.filters)
         self.sarv_filter_page = self._scroll(self.sarv_filters)
         self.search_page = self._scroll(self.search)
-        self.personal_page = self._scroll(self.personal)
         self.tabs.addTab(self.filter_page, plugin.t("EGT filtrid"))
         self.tabs.addTab(self.sarv_filter_page, plugin.t("SARV filtrid"))
         self.tabs.addTab(self.search_page, plugin.t("Otsing"))
-        self.tabs.addTab(self.personal_page, plugin.t("Isiklik"))
         self.tabs.addTab(self.details, plugin.t("Objekti andmed"))
         self.setWidget(self.tabs)
 
@@ -3333,48 +2637,6 @@ def _sarv_analysis_track(row):
         "z_suht_alumine": bottom,
         "_url": f"https://geoloogia.info/analysis/{row.get('id')}",
         "_label": f"SARV {row.get('id')}",
-    }
-
-
-def _personal_track(row, kind):
-    if kind == "analysis":
-        intervals = [
-            result for result in row.get("results", [])
-            if result.get("depth_from") not in (None, "")
-            or result.get("depth_to") not in (None, "")
-        ]
-        if not intervals:
-            return None
-        starts = [
-            _number(result.get("depth_from"))
-            for result in intervals
-            if result.get("depth_from") not in (None, "")
-        ]
-        ends = [
-            _number(
-                result.get("depth_to")
-                if result.get("depth_to") not in (None, "")
-                else result.get("depth_from")
-            )
-            for result in intervals
-        ]
-        if not starts:
-            return None
-        return {
-            "z_suht_ylemine": min(starts),
-            "z_suht_alumine": max(ends or starts),
-            "_label": f"{row.get('code') or row.get('lab_number') or row.get('id')}",
-        }
-    start = row.get("depth_from")
-    if start in (None, ""):
-        return None
-    end = row.get("depth_to")
-    return {
-        "z_suht_ylemine": _number(start),
-        "z_suht_alumine": (
-            _number(end) if end not in (None, "") else _number(start)
-        ),
-        "_label": str(row.get("number") or row.get("id") or ""),
     }
 
 

@@ -12,7 +12,6 @@ EN = {
     "EGT filtrid": "EGS filters",
     "SARV filtrid": "SARV filters",
     "Otsing": "Search",
-    "Isiklik": "Personal",
     "Objekti andmed": "Object data",
     "Üldandmed": "Overview",
     "Läbilõige": "Log",
@@ -23,7 +22,6 @@ EN = {
     "Eksemplarid": "Specimens",
     "Kirjandus": "Literature",
     "Allikas": "Source",
-    "MINU": "MINE",
     "Seotud andmed": "Related data",
     "Puursüdamik olemas": "Drill core available",
     "Proovid olemas": "Samples available",
@@ -41,6 +39,15 @@ EN = {
     "Koonda kattuvad": "Group overlaps",
     "Vigane alumine sügavus": "Invalid bottom depth",
     "Indeks": "Index",
+    "EGT detailandmete allikas": "EGT detail data source",
+    "WFS – kiirem laadimine": "WFS – faster loading",
+    "API – kiiremini uuenevad andmed": "API – faster data updates",
+    "Puuraugud ja vaatluspunktid": "Boreholes and observation points",
+    "API valik kasutab puuraukudel GEA API-t. Vaatluspunktide detailandmeid avalik GEA API praegu ei paku, seega kasutatakse nende puhul WFS-i.": (
+        "The API option uses the GEA API for boreholes. The public GEA API "
+        "does not currently expose observation-point details, so WFS is used "
+        "for those."
+    ),
     "Litoloogia": "Lithology",
     "Piiride sügavused": "Boundary depths",
     "Kastipiirid": "Core box boundaries",

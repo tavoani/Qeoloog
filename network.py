@@ -7,6 +7,8 @@ from qgis.PyQt.QtCore import QUrl, QUrlQuery, QXmlStreamReader
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from qgis.core import QgsNetworkAccessManager
 
+from .stratigraphy import STRATIGRAPHIC_INDEX_SET
+
 
 AUQ_REST = "https://gis.egt.ee/arcgis/rest/services/AUQ_public/AUQ_webapp_open/MapServer"
 EGT_WFS = "https://maps.egt.ee/geoserver/faktika/ows"
@@ -298,55 +300,86 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
-    def query_egt_object_by_gea_id(self, gea_id, success, failure):
-        """Resolve a public numeric GEA ID to its WFS object and UUID."""
-        value = str(gea_id or "").strip()
-        if not value.isdigit():
-            failure("GEA ID must be a positive integer.")
+    def query_stratigraphic_parent_ids(
+        self, indices, success, failure, page_size=2000,
+    ):
+        """Return EGT object UUIDs matching selected unit or compound indices."""
+        selected = sorted({
+            str(index).strip()
+            for index in indices
+            if str(index).strip() in STRATIGRAPHIC_INDEX_SET
+        })
+        if not selected:
+            success(set())
             return
-        queue = [
-            ("borehole", "faktika:puurauk"),
-            ("observation", "faktika:Vaatluspunkt"),
-        ]
-        errors = []
 
-        def load_next():
-            if not queue:
-                failure(
-                    "; ".join(errors)
-                    if errors else f"GEA object {value} was not found."
-                )
+        # Keep URLs short even when many checkboxes are selected.
+        batches = [
+            selected[offset:offset + 20]
+            for offset in range(0, len(selected), 20)
+        ]
+        type_names = (
+            "faktika:puurauk_geoloogiline_yksus",
+            "faktika:vaatluspunkt_geoloogiline_yksus",
+        )
+        tasks = [
+            (type_name, batch)
+            for type_name in type_names
+            for batch in batches
+        ]
+        parent_ids = set()
+
+        def load_task(task_index, start_index=0):
+            if task_index >= len(tasks):
+                success(parent_ids)
                 return
-            source_type, type_name = queue.pop(0)
+            type_name, batch = tasks[task_index]
+            clauses = []
+            for index in batch:
+                safe = index.replace("'", "''")
+                clauses.append(
+                    "("
+                    f"indeks ILIKE '{safe}%' OR "
+                    f"liityksus_indeks_ylemine ILIKE '{safe}%' OR "
+                    f"liityksus_indeks_alumine ILIKE '{safe}%'"
+                    ")"
+                )
             url = QUrl(EGT_WFS)
             query = QUrlQuery()
-            for key, parameter in (
+            for key, value in (
                 ("service", "WFS"),
                 ("version", "2.0.0"),
                 ("request", "GetFeature"),
                 ("typeNames", type_name),
                 ("outputFormat", "application/json"),
-                ("count", "2"),
-                ("CQL_FILTER", f"gea_id={value}"),
+                ("propertyName", "puurauk_vaatluspunkt_id"),
+                ("count", str(page_size)),
+                ("startIndex", str(start_index)),
+                ("CQL_FILTER", " OR ".join(clauses)),
             ):
-                query.addQueryItem(key, parameter)
+                query.addQueryItem(key, value)
             url.setQuery(query)
 
             def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid EGT WFS response")
+                    return
                 features = payload.get("features", [])
-                if features:
-                    properties = features[0].get("properties", {})
-                    success(source_type, properties)
+                for feature in features:
+                    value = (
+                        feature.get("properties", {})
+                        .get("puurauk_vaatluspunkt_id")
+                    )
+                    if value not in (None, ""):
+                        parent_ids.add(str(value).upper())
+                if len(features) >= page_size:
+                    load_task(task_index, start_index + len(features))
                 else:
-                    load_next()
+                    load_task(task_index + 1)
 
-            def failed(error):
-                errors.append(str(error))
-                load_next()
+            self.get_json(url, decoded, failure)
 
-            self.get_json(url, decoded, failed)
-
-        load_next()
+        load_task(0)
 
     def query_borehole_profile(self, global_id, success, failure):
         """Load a borehole and its nested geology from EGT's public GEA API."""
@@ -363,7 +396,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.9.1",
+            "QGIS Qeoloog/3.10.0",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

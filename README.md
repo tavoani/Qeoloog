@@ -1,4 +1,4 @@
-# Qeoloog 3.9.1
+# Qeoloog 3.10.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -20,13 +20,6 @@ Validated EGT–SARV link corrections can associate an EGT object with a SARV
 drill core, locality or research site. They are stored locally, applied
 immediately to the combined detail view, restored to the original GEA link and
 exported together as CSV or JSON.
-
-The **Personal** tab manages a standards-compliant local GeoPackage for private
-samples, specimens, analyses and results. Laboratory CSV, TSV and XLSX files
-are imported through a preview and explicit column-mapping step. Personal
-records can be displayed beside EGT and SARV records and exported as auditable
-GEA- or SARV-shaped converter packages containing CSV tables, a manifest and a
-validation report.
 
 ## Tööriistariba
 
@@ -54,12 +47,14 @@ püsiv asukoht jääb endiselt tema kodurippmenüüsse.
 Hammasratta alt saab:
 
 - valida kogu kasutajaliidese eesti või inglise keele;
+- valida EGT läbilõike detailandmete esmaseks allikaks WFS-i või GEA API;
 - näidata või peita LK rippmenüüde rühmi;
 - paigutada iga kihi põhiribale, tema kindlasse kodurippmenüüsse või keelata;
 - lisada ja eemaldada WMS/WFS kihte ning SARV punktikataloogi;
 - lugeda GetCapabilities-kihiloendi;
 - muuta tähist, värvi, nime, URL-i, kihinime ja WMS-stiili;
 - lülitada sisse režiimi, kus otsenupu korduv vajutus eemaldab kihi;
+- eksportida kõik kohalikud EGT–SARV seoseparandused CSV- või JSON-failina;
 - taastada Qeoloogi vaikekataloogi.
 
 Kihi kodurühm on pärast loomist lukus: näiteks katastriüksuseid ei saa tõsta
@@ -120,10 +115,13 @@ SARV serverist alles filtri rakendamisel.
 
 **Otsing** leiab samast tabelist laaditud EGT puuraugud/vaatluspunktid ja SARV
 kohad nime, numbri või ID, kaardiulatuse, sügavuse ning proovi- või
-analüüsitunnuste järgi. Otsingus saab eraldi valida objektitüübid ning
-puursüdamiku, proovide ja analüüside olemasolu. Tulemust saab nupust kaardil
-avada ja objektivaatesse laadida ilma kaardi mõõtkava muutmata. Täpsed numbri-
-ja ID-vasted ning nimevasted kuvatakse enne osalisi vasteid. Kuvatakse kuni 500
+analüüsitunnuste järgi. EGT objekte saab otsida ka EGT 2023
+stratigraafilise skeemi indeksi järgi. Valitud indeksit võrreldakse tavavälja
+ning liitüksuse ülemise ja alumise indeksiga; üldisema indeksi valik hõlmab ka
+selle alamüksusi. Otsingus saab eraldi valida objektitüübid ning puursüdamiku,
+proovide ja analüüside olemasolu. Tulemust saab nupust kaardil avada ja
+objektivaatesse laadida ilma kaardi mõõtkava muutmata. Täpsed numbri- ja
+ID-vasted ning nimevasted kuvatakse enne osalisi vasteid. Kuvatakse kuni 500
 esimest vastet ning allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
 
 GEA `sarv_id` käsitletakse SARV puursüdamiku võõrvõtmena ega võrrelda sama
@@ -141,57 +139,19 @@ Parandus salvestub kohaliku QGIS-i kasutajaprofiili koos EGT võtme, algse GEA
 `sarv_id`, SARV objektitüübi ja ID ning muutmise ajaga ja läheb kohe seotud
 andmete laadimisel käiku. Nii saab näiteks EGT läbilõiget ja SARV lokaliteediga
 seotud puursüdamikukaste samas vaates koos kuvada. **Taasta GEA seos** eemaldab
-kohaliku paranduse.
-
-## Isiklikud andmed
-
-Paan **Isiklik** võimaldab luua või avada Qeoloogi isikliku GeoPackage'i. See
-sisaldab eraldi atribuudikihte andmekogumitele, objektiseostele, proovidele,
-eksemplaridele, analüüsidele, analüüsitulemustele, manustele ja
-impordipartiidele. Kirjetel on GeoPackage'i `fid` ning ekspordiks ja seosteks
-stabiilne UUID. Isiklikud proovid, analüüsid ja eksemplarid ilmuvad avatud EGT
-või SARV objekti vastavates paanides allikaga **MINU** ja neid saab allika
-linnukesest sisse või välja lülitada. Sügavusega kirjed kuvatakse ka läbilõikel
-eraldi **IP**, **IA** ja **IE** radadel ning neid saab **MINU** kontrollreal
-ükshaaval sisse või välja lülitada.
-
-Laboriandmeid saab importida CSV-, TSV- või XLSX-failist. XLSX puhul loetakse
-esimene tööleht. Enne salvestamist näitab Qeoloog kuni 20 rea eelvaadet ja
-veerukaardistust; kohustuslikud on proovi tähis, analüüsinäitaja ja tulemuse
-väärtus. Toetatud on nii pikk vorm (üks analüüsitulemus real) kui lai vorm
-(näitajad, näiteks SiO₂ ja Fe₂O₃, eraldi veergudes). Laia vormi
-tulemuseveerud valib kasutaja enne importi. Valikulised väljad hõlmavad muu
-hulgas analüüsi koodi, eksemplari
-tähist, sügavusintervalli, ühikut, meetodit, laborit, kuupäeva, määramispiiri ja
-määramatust. Vigased või puuduliku võtmeinfoga read lähevad impordiaruandesse,
-mitte ei seostu vaikides vale väljaga.
-
-Impordi sihtobjekti tüübid sõltuvad valitud allikast: GEA puhul saab valida
-puuraugu või vaatluspunkti ning SARV puhul lokaliteedi, uuringupunkti või
-puursüdamiku. GEA või SARV ID sisestamisel täidab Qeoloog allikast automaatselt
-objekti tüübi, sisemise lähte-ID, nime ning olemasolu korral ka teise andmebaasi
-ID. SARV puhul valitakse tüüp enne päringut, sest eri SARV objektitüüpidel võivad
-olla samad numbrilised ID-d.
-
-Samast paanist saab:
-
-- eksportida isiklikud andmed GEA-kujulise ZIP-konverteripaketina
-  (`proov.csv`, `analyys_mootmine.csv`, `analyys_tulem.csv`);
-- eksportida SARV-kujulise ZIP-konverteripaketina (`sample.csv`,
-  `specimen.csv`, `analysis.csv`, `analysis_results.csv`);
-- eksportida kohalikud EGT–SARV seoseparandused ühe CSV- või JSON-failina.
-
-Mõlemad konverteripaketid sisaldavad `manifest.json` ja `validation.csv`.
-Need on kontrollitavad vaheformaadid, mitte automaatne kirjutamine GEA või SARV
-andmebaasi: enne sihtbaasi importi tuleb kontrollida asutuse klassifikaatorid,
-objektide ID-d ja kohustuslikud väljad.
+kohaliku paranduse. Kõik kohalikud parandused saab **Kihid** paanist koondatult
+CSV- või JSON-failina eksportida.
 
 Läbilõiget saab vertikaalselt suumida Windowsis `Ctrl` + kerimisratas ja macOS-is
 `Command` + kerimisratas. Tulba laius ei muutu. Uue objekti avamisel jääb viimati
 valitud andmepaan avatuks.
 
-Läbilõike stratigraafia, litoloogia ja sügavused laaditakse esmalt EGT WFS-ist.
-GEA API-d kasutatakse varuallikana ainult siis, kui WFS-päring ebaõnnestub.
+Läbilõike stratigraafia, litoloogia ja sügavuste esmase allika saab **Kihid**
+paanis valida. **WFS** laadib kiiremini; **API** saab GEA uuendused üldjuhul
+varem kätte. Puuraukude puhul kasutatakse valitud esmase allika tõrke korral
+teist allikat automaatselt varuallikana. Avalik GEA API ei paku praegu
+vaatluspunktide detailandmeid, mistõttu laaditakse nende läbilõige alati
+WFS-ist.
 Läbilõike veerud kuvatakse järjestuses sügavused, indeks, P, A, SP, SA, SE ja
 litoloogia.
 
