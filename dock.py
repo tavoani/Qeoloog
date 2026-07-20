@@ -2065,7 +2065,9 @@ class DetailWidget(QWidget):
 
     def add_sarv_match_editor(
         self, current_type, current_id, manual, edit_callback,
-        reset_callback=None,
+        reset_callback=None, source_sarv_id="", source_ma_id="",
+        invalid_sarv_id=False, invalid_ma_id=False,
+        invalid_callback=None,
     ):
         row = self.overview.rowCount()
         self.overview.insertRow(row)
@@ -2136,6 +2138,32 @@ class DetailWidget(QWidget):
             button = QPushButton(self.plugin.t("Taasta GEA seos"))
             button.clicked.connect(reset_callback)
             layout.addWidget(button)
+        if source_sarv_id not in (None, ""):
+            invalid_sarv = QCheckBox(
+                f"{self.plugin.t('Vigane GEA sarv_id seos')}: "
+                f"{source_sarv_id}"
+            )
+            invalid_sarv.setChecked(bool(invalid_sarv_id))
+            if invalid_callback:
+                invalid_sarv.toggled.connect(
+                    lambda checked: invalid_callback(
+                        "invalid_sarv_id", checked
+                    )
+                )
+            layout.addWidget(invalid_sarv)
+        if source_ma_id not in (None, ""):
+            invalid_ma = QCheckBox(
+                f"{self.plugin.t('Vigane Maa-ameti ID seos')}: "
+                f"{source_ma_id}"
+            )
+            invalid_ma.setChecked(bool(invalid_ma_id))
+            if invalid_callback:
+                invalid_ma.toggled.connect(
+                    lambda checked: invalid_callback(
+                        "invalid_ma_id", checked
+                    )
+                )
+            layout.addWidget(invalid_ma)
         layout.addStretch(1)
         self.overview.setCellWidget(row, 1, host)
         self.overview.resizeColumnsToContents()

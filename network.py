@@ -300,6 +300,46 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
+    def query_egt_object(
+        self, role, key_type, key_value, success, failure,
+    ):
+        """Resolve a persisted EGT key to current WFS object attributes."""
+        type_name = (
+            "faktika:puurauk"
+            if role == "boreholes" else "faktika:Vaatluspunkt"
+        )
+        value = str(key_value or "").strip()
+        if key_type == "gea":
+            if not value.isdigit():
+                failure("Invalid GEA ID")
+                return
+            cql_filter = f"gea_id={value}"
+        else:
+            safe = value.replace("'", "''")
+            cql_filter = f"esri_globalid='{safe}'"
+        url = QUrl(EGT_WFS)
+        query = QUrlQuery()
+        for key, parameter in (
+            ("service", "WFS"),
+            ("version", "2.0.0"),
+            ("request", "GetFeature"),
+            ("typeNames", type_name),
+            ("outputFormat", "application/json"),
+            ("count", "2"),
+            ("CQL_FILTER", cql_filter),
+        ):
+            query.addQueryItem(key, parameter)
+        url.setQuery(query)
+
+        def decoded(payload):
+            features = payload.get("features", [])
+            if not features:
+                failure(f"EGT object {value} was not found")
+                return
+            success(features[0].get("properties", {}))
+
+        self.get_json(url, decoded, failure)
+
     def query_stratigraphic_parent_ids(
         self, indices, success, failure, page_size=2000,
     ):
@@ -396,7 +436,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.10.0",
+            "QGIS Qeoloog/3.11.0",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

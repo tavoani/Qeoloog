@@ -140,6 +140,11 @@ class QeoloogPlugin:
                     egt_id if key_type == "gea" else ""
                 ),
                 "original_gea_sarv_id": value.get("original_sarv_id") or "",
+                "original_ma_orig_id": value.get("original_ma_id") or "",
+                "invalid_original_sarv_id": bool(
+                    value.get("invalid_sarv_id")
+                ),
+                "invalid_land_board_id": bool(value.get("invalid_ma_id")),
                 "sarv_object_type": object_type,
                 "sarv_object_id": object_id,
                 "sarv_drillcore_id": (
@@ -153,7 +158,7 @@ class QeoloogPlugin:
             target.write_text(
                 json.dumps({
                     "format": "Qeoloog EGT–SARV link corrections",
-                    "version": 1,
+                    "version": 2,
                     "exported_at": datetime.now(timezone.utc).isoformat(),
                     "links": rows,
                 }, ensure_ascii=False, indent=2),
@@ -164,7 +169,9 @@ class QeoloogPlugin:
                 target = target.with_suffix(".csv")
             fieldnames = (
                 "egt_role", "egt_key_type", "egt_id", "gea_id",
-                "original_gea_sarv_id", "sarv_object_type",
+                "original_gea_sarv_id", "original_ma_orig_id",
+                "invalid_original_sarv_id", "invalid_land_board_id",
+                "sarv_object_type",
                 "sarv_object_id", "sarv_drillcore_id", "source",
                 "updated_at",
             )
@@ -2491,7 +2498,18 @@ class QeoloogPlugin:
             match_entity = (
                 locality if isinstance(locality, dict) else entity
             )
-            candidates = self._egt_candidates_for_sarv_point(match_entity)
+            source_type = overview["source_type"]
+            manual_links = self._manual_egt_links_for_sarv(
+                source_type, entity.get("id"),
+            )
+            if len(manual_links) == 1:
+                self._open_manual_egt_link(
+                    manual_links[0], token, failed("EGT"),
+                )
+                return
+            candidates = self._egt_candidates_for_sarv_point(
+                match_entity, source_type, entity.get("id"),
+            )
             confirmed = [item for item in candidates if item.get("confirmed")]
             if len(confirmed) == 1:
                 details.add_match_candidates(
@@ -2559,7 +2577,115 @@ class QeoloogPlugin:
             failed("SARV samples"),
         )
 
-    def _egt_candidates_for_sarv_point(self, entity):
+    def _manual_egt_links_for_sarv(self, source_type, source_id):
+        links = []
+        for match_key, value in self.sarv_matches.items():
+            if not isinstance(value, dict):
+                continue
+            if (
+                value.get("source_type") != source_type
+                or str(value.get("sarv_id") or "") != str(source_id)
+            ):
+                continue
+            key_parts = str(match_key).split(":", 2)
+            if (
+                len(key_parts) != 3
+                or key_parts[0] not in {"boreholes", "observations"}
+                or key_parts[1] not in {"gea", "global"}
+            ):
+                continue
+            links.append({
+                "role": key_parts[0],
+                "key_type": key_parts[1],
+                "key_value": key_parts[2],
+                "record": value,
+            })
+        return links
+
+    def _egt_candidate_from_attributes(self, role, attributes, manual=False):
+        global_id = (
+            attributes.get("esri_globalid") or attributes.get("globalid")
+        )
+        if not global_id:
+            return None
+        gea_id = attributes.get("gea_id")
+        object_path = (
+            "puurauk" if role == "boreholes" else "vaatluspunkt"
+        )
+        display = (
+            attributes.get("nimi") or attributes.get("alias")
+            or gea_id or global_id
+        )
+        return {
+            "id": global_id,
+            "role": role,
+            "attributes": attributes,
+            "text": str(display),
+            "url": (
+                f"https://gis.egt.ee/auk/{object_path}/{gea_id}/vaade"
+                if gea_id else ""
+            ),
+            "evidence": self.t(
+                "Kohalik parandus" if manual else "Käsitsi kinnitatud"
+            ),
+            "confirmed": True,
+            "manual": bool(manual),
+            "score": 5000 if manual else 2000,
+        }
+
+    def _loaded_egt_candidate(self, link):
+        role = link.get("role")
+        key_type = link.get("key_type")
+        value = str(link.get("key_value") or "")
+        for layer in self._role_layers(role):
+            if key_type == "gea" and value.isdigit():
+                expression = f'"gea_id" = {value}'
+            else:
+                field = next((
+                    name for name in ("esri_globalid", "globalid")
+                    if layer.fields().indexOf(name) >= 0
+                ), "")
+                if not field:
+                    continue
+                safe = value.replace("'", "''")
+                expression = f'"{field}" = \'{safe}\''
+            request = QgsFeatureRequest().setFilterExpression(expression)
+            request.setLimit(1)
+            for feature in layer.getFeatures(request):
+                attributes = {
+                    field.name(): feature.attribute(field.name())
+                    for field in layer.fields()
+                }
+                return self._egt_candidate_from_attributes(
+                    role, attributes, manual=True,
+                )
+        return None
+
+    def _open_manual_egt_link(self, link, token, failure):
+        candidate = self._loaded_egt_candidate(link)
+        if candidate:
+            self._open_egt_candidate(candidate)
+            return
+
+        def loaded(attributes):
+            if token != self._detail_token:
+                return
+            candidate = self._egt_candidate_from_attributes(
+                link.get("role"), attributes, manual=True,
+            )
+            if candidate:
+                self._open_egt_candidate(candidate)
+            else:
+                failure("Invalid EGT response")
+
+        self.network.query_egt_object(
+            link.get("role"), link.get("key_type"),
+            link.get("key_value"), loaded, failure,
+        )
+
+    def _egt_candidates_for_sarv_point(
+        self, entity, source_type="", source_id="",
+    ):
         try:
             latitude = float(entity.get("latitude"))
             longitude = float(entity.get("longitude"))
@@ -2612,6 +2738,17 @@ class QeoloogPlugin:
                         direct_request.setLimit(20)
                         for feature in layer.getFeatures(direct_request):
                             features[feature.id()] = feature
+                    if (
+                        source_type == "drillcore"
+                        and str(source_id).isdigit()
+                        and layer.fields().indexOf("sarv_id") >= 0
+                    ):
+                        sarv_request = QgsFeatureRequest().setFilterExpression(
+                            f'"sarv_id" = {int(source_id)}'
+                        )
+                        sarv_request.setLimit(20)
+                        for feature in layer.getFeatures(sarv_request):
+                            features[feature.id()] = feature
                     for feature in features.values():
                         geometry = QgsGeometry(feature.geometry())
                         geometry.transform(QgsCoordinateTransform(
@@ -2624,6 +2761,15 @@ class QeoloogPlugin:
                             field.name(): feature.attribute(field.name())
                             for field in layer.fields()
                         }
+                        record = self.sarv_matches.get(
+                            self._egt_match_key(role, attrs), {}
+                        )
+                        if not isinstance(record, dict):
+                            record = {}
+                        invalid_sarv_id = bool(
+                            record.get("invalid_sarv_id")
+                        )
+                        invalid_ma_id = bool(record.get("invalid_ma_id"))
                         try:
                             wgs_geometry = QgsGeometry(feature.geometry())
                             wgs_geometry.transform(QgsCoordinateTransform(
@@ -2647,9 +2793,14 @@ class QeoloogPlugin:
                             if attrs.get(key) not in (None, "")
                         }
                         direct = bool(
-                            land_board_id
-                            and land_board_id
+                            not invalid_ma_id and land_board_id
                             == self._normalized(attrs.get("ma_orig_id"))
+                        )
+                        explicit = bool(
+                            not invalid_sarv_id
+                            and source_type == "drillcore"
+                            and str(attrs.get("sarv_id") or "").strip()
+                            == str(source_id)
                         )
                         number_match = bool(
                             sarv_number and sarv_number in egt_numbers
@@ -2676,7 +2827,7 @@ class QeoloogPlugin:
                             except (TypeError, ValueError):
                                 pass
                         confirmed = (
-                            direct
+                            direct or explicit
                             or distance <= 25 and number_match
                             or distance <= 10 and depth_diff is not None and depth_diff <= 1
                         )
@@ -2695,6 +2846,8 @@ class QeoloogPlugin:
                         evidence = [f"{distance:.0f} m"]
                         if direct:
                             evidence.append(self.t("ametlik ID kattub"))
+                        if explicit:
+                            evidence.append(self.t("SARV ID kattub"))
                         if number_match:
                             evidence.append(self.t("number kattub"))
                         if depth_diff is not None:
@@ -2716,6 +2869,7 @@ class QeoloogPlugin:
                             "confirmed": confirmed,
                             "score": (
                                 1000 if direct else 0
+                            ) + (800 if explicit else 0
                             ) + (200 if number_match else 0) + (
                                 100 if name_match else 0
                             ) + max(0, 100 - distance),
@@ -3113,23 +3267,73 @@ class QeoloogPlugin:
             value = self.sarv_matches.get(match_key) if match_key else None
             return value if isinstance(value, dict) else None
 
+        def has_manual_match(value=None):
+            value = saved_match() if value is None else value
+            if not isinstance(value, dict):
+                return False
+            source_type = value.get("source_type")
+            source_id = str(value.get("sarv_id") or "").strip()
+            return (
+                source_type in {"drillcore", "locality", "site"}
+                and source_id.isdigit() and int(source_id) > 0
+            )
+
+        def save_record(value):
+            if not match_key:
+                return
+            keep = (
+                has_manual_match(value)
+                or bool(value.get("invalid_sarv_id"))
+                or bool(value.get("invalid_ma_id"))
+            )
+            if keep:
+                self.sarv_matches[match_key] = value
+            else:
+                self.sarv_matches.pop(match_key, None)
+            PluginSettings.save_sarv_matches(self.sarv_matches)
+
         def persist_match(source_type, source_id):
             if not match_key:
                 return
-            self.sarv_matches[match_key] = {
+            value = dict(saved_match() or {})
+            value.update({
                 "source_type": source_type,
                 "sarv_id": source_id,
                 "gea_id": str(attributes.get("gea_id") or ""),
                 "original_sarv_id": sarv_id,
+                "original_ma_id": str(attributes.get("ma_orig_id") or ""),
                 "source": "local_override",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            PluginSettings.save_sarv_matches(self.sarv_matches)
+            })
+            save_record(value)
+
+        def persist_invalid(field, checked):
+            if field not in {"invalid_sarv_id", "invalid_ma_id"}:
+                return
+            value = dict(saved_match() or {})
+            value[field] = bool(checked)
+            value.update({
+                "gea_id": str(attributes.get("gea_id") or ""),
+                "original_sarv_id": sarv_id,
+                "original_ma_id": str(attributes.get("ma_orig_id") or ""),
+                "source": (
+                    (value.get("source") or "local_override")
+                    if has_manual_match(value)
+                    else "invalid_source_id"
+                ),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            save_record(value)
+            self.success(self.t("Vigase ID märge salvestati"))
+            refresh_resolution()
 
         def remove_manual(candidate=None):
-            if match_key:
-                self.sarv_matches.pop(match_key, None)
-                PluginSettings.save_sarv_matches(self.sarv_matches)
+            value = dict(saved_match() or {})
+            for field in ("source_type", "sarv_id"):
+                value.pop(field, None)
+            value["source"] = "invalid_source_id"
+            value["updated_at"] = datetime.now(timezone.utc).isoformat()
+            save_record(value)
             self.success(
                 "Local SARV correction removed; the GEA link is active again."
                 if self.language == "en" else
@@ -3160,9 +3364,18 @@ class QeoloogPlugin:
                 return
             candidates = self._sarv_candidates_for_egt(
                 localities, sites, attributes, drillcores,
+                invalid_sarv_id=bool(
+                    saved_match() and saved_match().get("invalid_sarv_id")
+                ),
+                invalid_ma_id=bool(
+                    saved_match() and saved_match().get("invalid_ma_id")
+                ),
             )
             saved = saved_match()
-            if saved and saved.get("source_type") != "drillcore":
+            if (
+                has_manual_match(saved)
+                and saved.get("source_type") != "drillcore"
+            ):
                 manual = next((
                     item for item in candidates
                     if item.get("source_type") == saved.get("source_type")
@@ -3181,6 +3394,10 @@ class QeoloogPlugin:
                         manual = self._sarv_candidate(
                             row, saved.get("source_type"), attributes,
                             allow_weak=True,
+                            invalid_sarv_id=bool(
+                                saved.get("invalid_sarv_id")
+                            ),
+                            invalid_ma_id=bool(saved.get("invalid_ma_id")),
                         )
                 if manual:
                     manual["confirmed"] = True
@@ -3214,16 +3431,23 @@ class QeoloogPlugin:
             if not match_key:
                 return
             saved = saved_match()
-            manual = bool(saved)
+            manual = has_manual_match(saved)
             current_id = (
-                saved.get("sarv_id") if saved else sarv_id
+                saved.get("sarv_id") if manual else sarv_id
             )
             current_type = (
-                saved.get("source_type") if saved else "drillcore"
+                saved.get("source_type") if manual else "drillcore"
             )
             details.add_sarv_match_editor(
                 current_type, current_id, manual, set_manual_sarv_object,
                 remove_manual if manual else None,
+                source_sarv_id=sarv_id,
+                source_ma_id=attributes.get("ma_orig_id"),
+                invalid_sarv_id=bool(
+                    saved and saved.get("invalid_sarv_id")
+                ),
+                invalid_ma_id=bool(saved and saved.get("invalid_ma_id")),
+                invalid_callback=persist_invalid,
             )
 
         def display_direct_entity(
@@ -3239,6 +3463,12 @@ class QeoloogPlugin:
                 return
             candidate = self._sarv_candidate(
                 entity, source_type, attributes, allow_weak=True,
+                invalid_sarv_id=bool(
+                    saved_match() and saved_match().get("invalid_sarv_id")
+                ),
+                invalid_ma_id=bool(
+                    saved_match() and saved_match().get("invalid_ma_id")
+                ),
             )
             if not candidate:
                 clear_sarv()
@@ -3261,8 +3491,9 @@ class QeoloogPlugin:
             clear_sarv()
             render_editor()
             saved = saved_match()
+            manual = has_manual_match(saved)
             saved_type = (
-                saved.get("source_type") if saved else ""
+                saved.get("source_type") if manual else ""
             )
             valid_saved_type = saved_type in {
                 "drillcore", "locality", "site",
@@ -3272,7 +3503,7 @@ class QeoloogPlugin:
             )
             effective_id = str(
                 saved.get("sarv_id") if valid_saved_type
-                else "" if saved else sarv_id
+                else "" if saved and saved.get("invalid_sarv_id") else sarv_id
             ).strip()
             valid_id = effective_id.isdigit() and int(effective_id) > 0
             if valid_id:
@@ -3281,13 +3512,13 @@ class QeoloogPlugin:
                     and str(prefetched_core.get("id")) == effective_id
                 ):
                     display_direct_entity(
-                        prefetched_core, source_type, bool(saved), generation,
+                        prefetched_core, source_type, manual, generation,
                     )
                     return
 
                 def direct_loaded(entity):
                     display_direct_entity(
-                        entity, source_type, bool(saved), generation,
+                        entity, source_type, manual, generation,
                     )
 
                 def direct_failed(error):
@@ -3370,6 +3601,7 @@ class QeoloogPlugin:
 
     def _sarv_candidates_for_egt(
         self, localities, sites, attributes, drillcores=(),
+        invalid_sarv_id=False, invalid_ma_id=False,
     ):
         candidates = []
         direct_core_candidate = None
@@ -3379,11 +3611,16 @@ class QeoloogPlugin:
             for row in rows:
                 candidate = self._sarv_candidate(
                     row, source_type, attributes,
+                    invalid_sarv_id=invalid_sarv_id,
+                    invalid_ma_id=invalid_ma_id,
                 )
                 if candidate:
                     candidates.append(candidate)
         sarv_id = str(attributes.get("sarv_id") or "").strip()
-        valid_sarv_id = sarv_id.isdigit() and int(sarv_id) > 0
+        valid_sarv_id = (
+            not invalid_sarv_id
+            and sarv_id.isdigit() and int(sarv_id) > 0
+        )
         if valid_sarv_id:
             core = next((
                 row for row in drillcores
@@ -3392,6 +3629,8 @@ class QeoloogPlugin:
             if core:
                 candidate = self._sarv_candidate(
                     core, "drillcore", attributes, allow_weak=True,
+                    invalid_sarv_id=invalid_sarv_id,
+                    invalid_ma_id=invalid_ma_id,
                 )
                 if candidate:
                     candidate["confirmed"] = True
@@ -3417,6 +3656,7 @@ class QeoloogPlugin:
 
     def _sarv_candidate(
         self, row, source_type, attributes, allow_weak=False,
+        invalid_sarv_id=False, invalid_ma_id=False,
     ):
         candidate_id = row.get("id")
         if candidate_id in (None, ""):
@@ -3463,10 +3703,10 @@ class QeoloogPlugin:
         )
         official_id = self._normalized(row.get("land_board_id"))
         official_match = bool(
-            official_id
+            not invalid_ma_id and official_id
             and official_id == self._normalized(attributes.get("ma_orig_id"))
         )
-        explicit_match = source_type == "drillcore" and (
+        explicit_match = not invalid_sarv_id and source_type == "drillcore" and (
             str(attributes.get("sarv_id") or "").strip() == str(candidate_id)
         )
         distance = self._point_distance_m(
