@@ -1,4 +1,4 @@
-# Qeoloog 3.12.0
+# Qeoloog 3.13.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -23,6 +23,10 @@ exported together as CSV or JSON.
 The geological profile draws subtle boundary guides from each boundary-depth
 label towards the lithology column. Hidden P, A, SP, SA and SE tracks are also
 removed from the horizontal layout so the profile becomes more compact.
+An optional **Apply filters** control filters profile markers with the active
+EGT and SARV sample, analysis and specimen-type filters. EGT map filters also
+include the complete official stratigraphic-index list and a partial
+**Contains** query across ordinary and compound indices.
 
 ## Tööriistariba
 
@@ -76,6 +80,10 @@ taastamiseks nupp **Lähtesta**. EGT
 koodinimetused loetakse automaatselt teenuse ametlikest ArcGIS-domeenidest ja
 neid kasutatakse nii objektivaates kui filtrites. Sama välja valikud seotakse
 OR-tingimusega, eri väljad AND-tingimusega; tühi valik tähendab kõiki.
+EGT filtrites saab objekte piirata ka EGT 2023 stratigraafilise skeemi kõigi
+indeksite mitmikvalikuga. Väli **Sisaldab** teeb osalise, tõstutundetu otsingu
+tavaindeksi ning liitüksuse ülemise ja alumise indeksi seest. Mitmikvaliku ja
+**Sisaldab** välja samaaegsel kasutamisel peavad mõlemad tingimused sobima.
 Puuraukude nimed kuvatakse vaikimisi 5 pt sildina 0,6 mm valge puhvriga.
 Vajuta **i**, seejärel klõpsa kaardil puuraugul või vaatluspunktis.
 Hetkel avatavat punkti tähistab kaardil kerge halo. Objektivaade sisaldab:
@@ -89,6 +97,8 @@ Hetkel avatavat punkti tähistab kaardil kerge halo. Objektivaade sisaldab:
 - sisse-välja lülitatavaid geoloogiliste piiride sügavussilte;
 - eraldi lülitatavaid EGT kastipiire, proove ja analüüse;
 - eraldi SARV real lülitatavaid proove, analüüse ja eksemplare;
+- valikut **Rakenda filtrid**, mis arvestab läbilõike P, A, SP, SA ja SE
+  markeritel aktiivseid EGT ja SARV tüübi-, meetodi- ning tulemusefiltreid;
 - kattuvate SARV markerite adaptiivset koondamist ja nelja horisontaalset rada;
 - poolläbipaistvat viirutust sügavustel, kus puursüdamiku kast puudub;
 - EGT ja SARV allika järgi lülitatavaid puursüdamiku kaste;
@@ -113,8 +123,8 @@ Neid kihte saab sama kaardiklõpsu tööriistaga avada nagu EGT punkte.
 Eraldi **SARV filtrid** paanis saab lülitada lokaliteete, uuringupunkte ja
 puursüdamikke, piirata tulemust kaardiulatuse ja sügavusega ning valida
 puursüdamiku, proovide, analüüside või eksemplaride olemasolu. Proovi eesmärk
-ja tüüp ning analüüsimeetod on mitmikvalikud. Mahukad seotud andmed päritakse
-SARV serverist alles filtri rakendamisel.
+ja tüüp, analüüsimeetod ning eksemplari tüüp on mitmikvalikud. Mahukad seotud
+andmed päritakse SARV serverist alles filtri rakendamisel.
 
 **Otsing** leiab samast tabelist laaditud EGT puuraugud/vaatluspunktid ja SARV
 kohad nime, numbri või ID, kaardiulatuse, sügavuse ning proovi- või

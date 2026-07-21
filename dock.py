@@ -544,6 +544,20 @@ class FilterWidget(QWidget):
             category_layout.addWidget(checkbox)
         layout.addWidget(category_group)
 
+        index_group = QGroupBox(t("Indeksi filtrid"))
+        index_layout = QFormLayout(index_group)
+        self.stratigraphic_index = MultiSelectButton(t("Kõik"))
+        self.stratigraphic_index.set_options(
+            (index, index) for index in STRATIGRAPHIC_INDICES
+        )
+        self.stratigraphic_index.selectionChanged.connect(self._changed)
+        self.stratigraphic_contains = QLineEdit()
+        self.stratigraphic_contains.setPlaceholderText(t("Sisaldab"))
+        self.stratigraphic_contains.editingFinished.connect(self._changed)
+        index_layout.addRow(t("Indeks"), self.stratigraphic_index)
+        index_layout.addRow(t("Sisaldab"), self.stratigraphic_contains)
+        layout.addWidget(index_group)
+
         related_group = QGroupBox(t("Seotud andmed"))
         related_layout = QFormLayout(related_group)
         self.related = {}
@@ -626,6 +640,8 @@ class FilterWidget(QWidget):
             self.observations.setChecked(True)
             for checkbox in self.categories.values():
                 checkbox.setChecked(True)
+            self.stratigraphic_index.clear_selection()
+            self.stratigraphic_contains.clear()
             for choice in self.related.values():
                 choice.setCurrentIndex(0)
             for choice in self.sample_filters.values():
@@ -641,6 +657,12 @@ class FilterWidget(QWidget):
 
     def related_requirements(self):
         return {key: choice.currentData() for key, choice in self.related.items()}
+
+    def stratigraphic_requirements(self):
+        return {
+            "indices": self.stratigraphic_index.selected_values(),
+            "contains": self.stratigraphic_contains.text().strip(),
+        }
 
     def egt_domain_requirements(self):
         return {
@@ -740,6 +762,13 @@ class SarvFilterWidget(QWidget):
         analysis_layout.addRow(t("Analüüsi meetod"), self.analysis_method)
         layout.addWidget(analysis_group)
 
+        specimen_group = QGroupBox(t("Eksemplaride filtrid"))
+        specimen_layout = QFormLayout(specimen_group)
+        self.specimen_type = MultiSelectButton(t("Kõik"))
+        self.specimen_type.selectionChanged.connect(self._changed)
+        specimen_layout.addRow(t("Eksemplari tüüp"), self.specimen_type)
+        layout.addWidget(specimen_group)
+
         note = QLabel(
             t("SARV seotud andmete filtrid päritakse vajadusel serverist. "
               "Tühi valik tähendab kõiki väärtusi.")
@@ -755,6 +784,9 @@ class SarvFilterWidget(QWidget):
     def reload_options(self):
         self.analysis_method.set_options(self.plugin.sarv_analysis_options)
         self.sample_type.set_options(self.plugin.sarv_sample_type_options)
+        self.specimen_type.set_options(
+            self.plugin.sarv_specimen_type_options
+        )
 
     def requirements(self):
         def number(widget):
@@ -777,6 +809,7 @@ class SarvFilterWidget(QWidget):
             "sample_purpose": self.sample_purpose.selected_values(),
             "sample_type": self.sample_type.selected_values(),
             "analysis_method": self.analysis_method.selected_values(),
+            "specimen_type": self.specimen_type.selected_values(),
         }
 
     def _changed(self):
@@ -796,6 +829,7 @@ class SarvFilterWidget(QWidget):
             self.sample_purpose.clear_selection()
             self.sample_type.clear_selection()
             self.analysis_method.clear_selection()
+            self.specimen_type.clear_selection()
         finally:
             self._resetting = False
         self.plugin.apply_sarv_filters()
@@ -1858,6 +1892,10 @@ class DetailWidget(QWidget):
         profile_page = QWidget()
         profile_layout = QVBoxLayout(profile_page)
         profile_controls = QHBoxLayout()
+        self.profile_apply_filters = QCheckBox(t("Rakenda filtrid"))
+        self.profile_apply_filters.setChecked(False)
+        profile_controls.addWidget(self.profile_apply_filters)
+        profile_controls.addSpacing(12)
         profile_controls.addWidget(QLabel("EGT:"))
         self.profile_lithology = QCheckBox(t("Litoloogia"))
         self.profile_boundary_depths = QCheckBox(t("Piiride sügavused"))
@@ -1898,6 +1936,9 @@ class DetailWidget(QWidget):
         profile_scroll.setWidget(self.profile)
         profile_layout.addWidget(profile_scroll)
         self.tabs.addTab(profile_page, t("Läbilõige"))
+        self.profile_apply_filters.toggled.connect(
+            self.refresh_profile_filters
+        )
         self.profile_lithology.toggled.connect(
             lambda checked: self.profile.set_options(lithology=checked)
         )
@@ -2351,7 +2392,7 @@ class DetailWidget(QWidget):
 
     def set_samples(self, rows):
         self._egt_samples = list(rows)
-        self.profile.set_samples(rows)
+        self.refresh_profile_filters()
         self._refresh_samples()
 
     def set_sarv_samples(self, rows, source="locality"):
@@ -2366,10 +2407,7 @@ class DetailWidget(QWidget):
                 else:
                     unique[str(row_id)] = row
         self._sarv_samples = list(unique.values()) + anonymous
-        self.profile.set_sarv_samples([
-            track for row in self._sarv_samples
-            if (track := _sarv_track(row, "sample")) is not None
-        ])
+        self.refresh_profile_filters()
         self._refresh_samples()
 
     def _refresh_samples(self):
@@ -2412,16 +2450,12 @@ class DetailWidget(QWidget):
 
     def set_analyses(self, rows, results_by_analysis=None):
         self._egt_analyses = (list(rows), results_by_analysis or {})
-        self.profile.set_analyses(rows)
+        self.refresh_profile_filters()
         self._refresh_analyses()
 
     def set_sarv_analyses(self, source, rows):
         self._sarv_analyses_by_source[source] = list(rows)
-        all_rows = sum(self._sarv_analyses_by_source.values(), [])
-        self.profile.set_sarv_analyses([
-            track for row in all_rows
-            if (track := _sarv_analysis_track(row)) is not None
-        ])
+        self.refresh_profile_filters()
         self._sarv_analysis_refs[source] = [
             {"reference": row.get("reference")} for row in rows if row.get("reference")
         ]
@@ -2476,11 +2510,129 @@ class DetailWidget(QWidget):
 
     def set_sarv_specimens(self, rows):
         self._sarv_specimens = list(rows)
+        self.refresh_profile_filters()
+        self._refresh_specimens()
+
+    @staticmethod
+    def _profile_filter_values(value):
+        values = set()
+        if isinstance(value, dict):
+            for key in (
+                "id", "code", "value", "value_en", "name", "name_en",
+                "type",
+            ):
+                if value.get(key) not in (None, ""):
+                    values.add(str(value[key]))
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                values.update(DetailWidget._profile_filter_values(item))
+        elif value not in (None, ""):
+            values.add(str(value))
+        return values
+
+    @classmethod
+    def _profile_value_matches(cls, value, selected):
+        return not selected or bool(
+            cls._profile_filter_values(value).intersection(selected)
+        )
+
+    def refresh_profile_filters(self, checked=None):
+        """Apply active EGT/SARV type filters only to profile markers."""
+        apply_filters = bool(
+            self.profile_apply_filters.isChecked() and self.plugin.dock
+        )
+        egt_samples = list(self._egt_samples)
+        egt_analyses, results_by_analysis = self._egt_analyses
+        egt_analyses = list(egt_analyses)
+        sarv_samples = list(self._sarv_samples)
+        sarv_analyses = sum(self._sarv_analyses_by_source.values(), [])
+        sarv_specimens = list(self._sarv_specimens)
+
+        if apply_filters:
+            egt_requirements = (
+                self.plugin.dock.filters.egt_domain_requirements()
+            )
+            sample_requirements = egt_requirements["samples"]
+            egt_samples = [
+                row for row in egt_samples
+                if self.plugin._row_matches_domains(
+                    row, sample_requirements
+                )
+            ]
+
+            analysis_requirements = egt_requirements["analyses"]
+            direct_requirements = {
+                field: selected
+                for (table_id, field), selected
+                in analysis_requirements.items()
+                if table_id == 3
+            }
+            result_requirements = {
+                field: selected
+                for (table_id, field), selected
+                in analysis_requirements.items()
+                if table_id == 4
+            }
+            filtered_analyses = []
+            for row in egt_analyses:
+                if not self.plugin._row_matches_domains(
+                    row, direct_requirements
+                ):
+                    continue
+                if any(result_requirements.values()):
+                    results = results_by_analysis.get(
+                        row.get("globalid"), []
+                    )
+                    if not any(
+                        self.plugin._row_matches_domains(
+                            result, result_requirements
+                        )
+                        for result in results
+                    ):
+                        continue
+                filtered_analyses.append(row)
+            egt_analyses = filtered_analyses
+
+            sarv_requirements = self.plugin.dock.sarv_filters.requirements()
+            sarv_samples = [
+                row for row in sarv_samples
+                if self._profile_value_matches(
+                    row.get("purpose"),
+                    sarv_requirements["sample_purpose"],
+                )
+                and self._profile_value_matches(
+                    row.get("type"), sarv_requirements["sample_type"],
+                )
+            ]
+            sarv_analyses = [
+                row for row in sarv_analyses
+                if self._profile_value_matches(
+                    row.get("analysis_method"),
+                    sarv_requirements["analysis_method"],
+                )
+            ]
+            sarv_specimens = [
+                row for row in sarv_specimens
+                if self._profile_value_matches(
+                    row.get("type"),
+                    sarv_requirements["specimen_type"],
+                )
+            ]
+
+        self.profile.set_samples(egt_samples)
+        self.profile.set_analyses(egt_analyses)
+        self.profile.set_sarv_samples([
+            track for row in sarv_samples
+            if (track := _sarv_track(row, "sample")) is not None
+        ])
+        self.profile.set_sarv_analyses([
+            track for row in sarv_analyses
+            if (track := _sarv_analysis_track(row)) is not None
+        ])
         self.profile.set_sarv_specimens([
-            track for row in rows
+            track for row in sarv_specimens
             if (track := _sarv_track(row, "specimen")) is not None
         ])
-        self._refresh_specimens()
 
     def _refresh_specimens(self):
         values = []

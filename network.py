@@ -341,15 +341,16 @@ class NetworkClient:
         self.get_json(url, decoded, failure)
 
     def query_stratigraphic_parent_ids(
-        self, indices, success, failure, page_size=2000,
+        self, indices, success, failure, page_size=2000, contains="",
     ):
-        """Return EGT object UUIDs matching selected unit or compound indices."""
+        """Return EGT UUIDs matching selected and/or partial unit indices."""
         selected = sorted({
             str(index).strip()
             for index in indices
             if str(index).strip() in STRATIGRAPHIC_INDEX_SET
         })
-        if not selected:
+        contains = str(contains or "").strip()
+        if not selected and not contains:
             success(set())
             return
 
@@ -357,7 +358,7 @@ class NetworkClient:
         batches = [
             selected[offset:offset + 20]
             for offset in range(0, len(selected), 20)
-        ]
+        ] or [[]]
         type_names = (
             "faktika:puurauk_geoloogiline_yksus",
             "faktika:vaatluspunkt_geoloogiline_yksus",
@@ -374,14 +375,26 @@ class NetworkClient:
                 success(parent_ids)
                 return
             type_name, batch = tasks[task_index]
-            clauses = []
+            selected_clauses = []
             for index in batch:
                 safe = index.replace("'", "''")
-                clauses.append(
+                selected_clauses.append(
                     "("
                     f"indeks ILIKE '{safe}%' OR "
                     f"liityksus_indeks_ylemine ILIKE '{safe}%' OR "
                     f"liityksus_indeks_alumine ILIKE '{safe}%'"
+                    ")"
+                )
+            filters = []
+            if selected_clauses:
+                filters.append("(" + " OR ".join(selected_clauses) + ")")
+            if contains:
+                safe_contains = contains.replace("'", "''")
+                filters.append(
+                    "("
+                    f"indeks ILIKE '%{safe_contains}%' OR "
+                    f"liityksus_indeks_ylemine ILIKE '%{safe_contains}%' OR "
+                    f"liityksus_indeks_alumine ILIKE '%{safe_contains}%'"
                     ")"
                 )
             url = QUrl(EGT_WFS)
@@ -395,7 +408,7 @@ class NetworkClient:
                 ("propertyName", "puurauk_vaatluspunkt_id"),
                 ("count", str(page_size)),
                 ("startIndex", str(start_index)),
-                ("CQL_FILTER", " OR ".join(clauses)),
+                ("CQL_FILTER", " AND ".join(filters)),
             ):
                 query.addQueryItem(key, value)
             url.setQuery(query)
@@ -436,7 +449,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.12.0",
+            "QGIS Qeoloog/3.13.0",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)

@@ -72,6 +72,16 @@ class QeoloogPlugin:
         15: ("mikropaleontoloogia ja geokeemia", "micropaleontology and geochemistry"),
         16: ("ehitusmaterjali uuringud", "building material testing"),
     }
+    SARV_SPECIMEN_TYPES = {
+        1: ("tervik", "single specimen"),
+        2: ("tervik osadena", "specimen in parts"),
+        3: ("terviku osa", "part of specimen"),
+        4: ("õhik / piil", "thin section / peel"),
+        5: ("mikrof. kaameras", "microfossil"),
+        6: ("mikrof. SEM alusel", "microfossil on SEM stub"),
+        7: ("mitu eksemplari", "multiple specimens"),
+        9: ("poleerlihv", "polished slab"),
+    }
     AK_CORRECTED_EXTENT = QgsRectangle(369548.1875, 6380032.5, 739208.1875, 6653113.0)
 
     def __init__(self, iface):
@@ -109,11 +119,20 @@ class QeoloogPlugin:
         self._egt_catalog_loading = False
         self._egt_result_filter_cache = {}
         self._egt_result_filter_loading = set()
+        self._egt_stratigraphic_filter_key = None
+        self._egt_stratigraphic_filter_allowed = None
+        self._egt_stratigraphic_filter_loading = None
+        self._egt_stratigraphic_filter_generation = 0
         self._sarv_points_loading = False
         self._sarv_point_cache = None
         self._sarv_point_waiters = []
         self.sarv_analysis_options = []
         self.sarv_sample_type_options = []
+        language_index = 1 if self.language == "en" else 0
+        self.sarv_specimen_type_options = [
+            (str(code), labels[language_index])
+            for code, labels in self.SARV_SPECIMEN_TYPES.items()
+        ]
         self._sarv_filter_generation = 0
         self.sarv_matches = PluginSettings.load_sarv_matches()
 
@@ -1205,6 +1224,7 @@ class QeoloogPlugin:
     def apply_egt_filters(self):
         if not self.dock:
             return
+        self.dock.details.refresh_profile_filters()
         category_expression = self._category_subset(self.dock.filters.selected_codes())
         requirements = self.dock.filters.related_requirements()
         related_expression = ""
@@ -1233,6 +1253,63 @@ class QeoloogPlugin:
                     related_expression = " AND ".join(
                         f"({clause})" for clause in combined if clause
                     )
+        stratigraphic = self.dock.filters.stratigraphic_requirements()
+        stratigraphic_key = (
+            tuple(sorted(stratigraphic["indices"])),
+            stratigraphic["contains"].casefold(),
+        )
+        stratigraphic_active = bool(
+            stratigraphic["indices"] or stratigraphic["contains"]
+        )
+        stratigraphic_expression = ""
+        if stratigraphic_active:
+            if self._egt_stratigraphic_filter_key == stratigraphic_key:
+                stratigraphic_expression = self._id_membership_clause(
+                    self._egt_stratigraphic_filter_allowed or set()
+                )
+            elif self._egt_stratigraphic_filter_loading != stratigraphic_key:
+                self._egt_stratigraphic_filter_generation += 1
+                generation = self._egt_stratigraphic_filter_generation
+                self._egt_stratigraphic_filter_loading = stratigraphic_key
+
+                def loaded_stratigraphy(values):
+                    if generation != self._egt_stratigraphic_filter_generation:
+                        return
+                    self._egt_stratigraphic_filter_loading = None
+                    self._egt_stratigraphic_filter_key = stratigraphic_key
+                    self._egt_stratigraphic_filter_allowed = set(values)
+                    self.apply_egt_filters()
+
+                def failed_stratigraphy(error):
+                    if generation != self._egt_stratigraphic_filter_generation:
+                        return
+                    self._egt_stratigraphic_filter_loading = None
+                    self.warning(
+                        (f"Could not apply the EGT index filter: {error}"
+                         if self.language == "en" else
+                         f"EGT indeksifiltri rakendamine ebaõnnestus: {error}")
+                    )
+
+                self.network.query_stratigraphic_parent_ids(
+                    stratigraphic["indices"], loaded_stratigraphy,
+                    failed_stratigraphy,
+                    contains=stratigraphic["contains"],
+                )
+        else:
+            if self._egt_stratigraphic_filter_loading is not None:
+                self._egt_stratigraphic_filter_generation += 1
+            self._egt_stratigraphic_filter_loading = None
+            self._egt_stratigraphic_filter_key = None
+            self._egt_stratigraphic_filter_allowed = None
+
+        combined_expressions = [
+            expression for expression in (
+                related_expression, stratigraphic_expression,
+            ) if expression
+        ]
+        related_expression = " AND ".join(
+            f"({expression})" for expression in combined_expressions
+        )
         visibility = {
             "boreholes": self.dock.filters.boreholes.isChecked(),
             "observations": self.dock.filters.observations.isChecked(),
@@ -1476,6 +1553,7 @@ class QeoloogPlugin:
     def apply_sarv_filters(self):
         if not self.dock:
             return
+        self.dock.details.refresh_profile_filters()
         requirements = self.dock.sarv_filters.requirements()
         self._sarv_filter_generation += 1
         generation = self._sarv_filter_generation
@@ -1522,6 +1600,7 @@ class QeoloogPlugin:
         advanced = (
             related_active or requirements["sample_purpose"]
             or requirements["sample_type"] or requirements["analysis_method"]
+            or requirements["specimen_type"]
         )
         if advanced:
             self._load_sarv_filter_matches(
@@ -1555,6 +1634,8 @@ class QeoloogPlugin:
                 )
             ) or (
                 key == "analyses" and requirements["analysis_method"]
+            ) or (
+                key == "specimens" and requirements["specimen_type"]
             )
             if requirement != "any" or selected:
                 conditions.append((key, requirement if not selected else "yes"))
@@ -1643,6 +1724,14 @@ class QeoloogPlugin:
                             (target, chunk, purpose, sample_type)
                             for purpose in purposes for sample_type in sample_types
                         )
+                    elif condition == "specimens":
+                        specimen_types = (
+                            sorted(requirements["specimen_type"]) or [None]
+                        )
+                        requests.extend(
+                            (target, chunk, None, specimen_type)
+                            for specimen_type in specimen_types
+                        )
                     else:
                         requests.append((target, chunk, None, None))
             if not requests:
@@ -1675,7 +1764,10 @@ class QeoloogPlugin:
                     fields = ("id", "sample")
                 else:
                     resource = "specimens"
-                    parameters = {"locality__in": ",".join(ids)}
+                    parameters = {
+                        "locality__in": ",".join(ids),
+                        "type": sample_type,
+                    }
                     fields = ("id", "locality")
 
                 def loaded(rows, target=target, condition=condition):
