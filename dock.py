@@ -1188,15 +1188,16 @@ class ProfileWidget(QWidget):
         self.group_sarv_overlaps = True
         self.core_applicable = False
         self.zoom_factor = 1.0
-        self.setMinimumWidth(720)
         self.setMouseTracking(True)
+        self._update_minimum_width()
         self._update_minimum_height()
 
     def sizeHint(self):
-        return QSize(900, self.minimumHeight())
+        return QSize(self.minimumWidth(), self.minimumHeight())
 
     def set_units(self, units):
         self.units = sorted(units, key=lambda item: _number(item.get("z_suht_ylemine")))
+        self._update_minimum_width()
         self._update_minimum_height()
 
     def set_core_boxes(self, rows):
@@ -1280,7 +1281,78 @@ class ProfileWidget(QWidget):
             self.show_sarv_specimens = sarv_specimens
         if sarv_grouping is not None:
             self.group_sarv_overlaps = sarv_grouping
+        self._update_minimum_width()
         self._update_minimum_height()
+
+    def _column_layout(self, metrics):
+        """Return compact column positions for the currently visible tracks."""
+        bar_left = 68
+        boundary_width = 64 if self.show_boundary_depths else 0
+        index_left = bar_left + self.BAR_WIDTH + boundary_width + 8
+        index_width = max(
+            76,
+            min(
+                140,
+                max(
+                    (
+                        metrics.horizontalAdvance(str(_unit_index(unit)))
+                        for unit in self.units
+                        if _unit_index(unit)
+                    ),
+                    default=66,
+                ) + 12,
+            ),
+        )
+        cursor = index_left + index_width
+        tracks = {}
+        for key, visible, width, gap in (
+            ("samples", self.show_samples, 11, 7),
+            ("analyses", self.show_analyses, 11, 9),
+            ("sarv_samples", self.show_sarv_samples, self.SARV_TRACK_WIDTH, 8),
+            ("sarv_analyses", self.show_sarv_analyses, self.SARV_TRACK_WIDTH, 8),
+            ("sarv_specimens", self.show_sarv_specimens, self.SARV_TRACK_WIDTH, 14),
+        ):
+            if not visible:
+                continue
+            tracks[key] = cursor
+            cursor += width + gap
+
+        lithology_left = cursor if tracks else cursor + 14
+        lithology_width = 0
+        if self.show_lithology:
+            lithology_width = max(
+                150,
+                min(
+                    320,
+                    max(
+                        (
+                            metrics.horizontalAdvance(str(
+                                unit.get("litoloogia")
+                                or unit.get("litoloogia_orig") or ""
+                            ))
+                            for unit in self.units
+                        ),
+                        default=138,
+                    ) + 12,
+                ),
+            )
+        content_right = (
+            lithology_left + lithology_width
+            if self.show_lithology else cursor
+        )
+        return {
+            "bar_left": bar_left,
+            "index_left": index_left,
+            "index_width": index_width,
+            "tracks": tracks,
+            "lithology_left": lithology_left,
+            "content_right": content_right,
+        }
+
+    def _update_minimum_width(self):
+        layout = self._column_layout(self.fontMetrics())
+        self.setMinimumWidth(max(360, round(layout["content_right"] + 20)))
+        self.updateGeometry()
 
     def wheelEvent(self, event):
         modifiers = event.modifiers()
@@ -1364,29 +1436,11 @@ class ProfileWidget(QWidget):
             max_depth * self.BASE_PIXELS_PER_METER * self.zoom_factor,
             self.height() - self.TOP_MARGIN - self.BOTTOM_MARGIN,
         )
-        bar_left = 68
-        boundary_label_width = 64 if self.show_boundary_depths else 0
-        index_left = bar_left + self.BAR_WIDTH + boundary_label_width + 8
-        index_width = max(
-            76,
-            min(
-                140,
-                max(
-                    (
-                        painter.fontMetrics().horizontalAdvance(str(_unit_index(unit)))
-                        for unit in self.units
-                        if _unit_index(unit)
-                    ),
-                    default=66,
-                ) + 12,
-            ),
-        )
-        sample_left = index_left + index_width
-        analysis_left = sample_left + 18
-        sarv_sample_left = analysis_left + 20
-        sarv_analysis_left = sarv_sample_left + self.SARV_TRACK_WIDTH + 8
-        sarv_specimen_left = sarv_analysis_left + self.SARV_TRACK_WIDTH + 8
-        lithology_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 14
+        layout = self._column_layout(painter.fontMetrics())
+        bar_left = layout["bar_left"]
+        index_left = layout["index_left"]
+        tracks = layout["tracks"]
+        lithology_left = layout["lithology_left"]
 
         def depth_y(depth):
             return self.TOP_MARGIN + draw_height * depth / max_depth
@@ -1397,19 +1451,19 @@ class ProfileWidget(QWidget):
             painter.drawText(lithology_left, 34, self.plugin.t("Litoloogia"))
         painter.setPen(QColor("#355e3b"))
         if self.show_samples:
-            painter.drawText(sample_left - 1, 34, "P")
+            painter.drawText(tracks["samples"] - 1, 34, "P")
         painter.setPen(QColor("#7b3f8c"))
         if self.show_analyses:
-            painter.drawText(analysis_left - 1, 34, "A")
+            painter.drawText(tracks["analyses"] - 1, 34, "A")
         painter.setPen(QColor("#267d92"))
         if self.show_sarv_samples:
-            painter.drawText(sarv_sample_left + 14, 34, "SP")
+            painter.drawText(tracks["sarv_samples"] + 14, 34, "SP")
         painter.setPen(QColor("#c06b25"))
         if self.show_sarv_analyses:
-            painter.drawText(sarv_analysis_left + 14, 34, "SA")
+            painter.drawText(tracks["sarv_analyses"] + 14, 34, "SA")
         painter.setPen(QColor("#b23a62"))
         if self.show_sarv_specimens:
-            painter.drawText(sarv_specimen_left + 14, 34, "SE")
+            painter.drawText(tracks["sarv_specimens"] + 14, 34, "SE")
         painter.setPen(QColor("#555555"))
         if self.show_core_boxes:
             painter.drawText(bar_left, 20, self.plugin.t("Kastipiirid"))
@@ -1427,6 +1481,7 @@ class ProfileWidget(QWidget):
             painter.drawText(2, y + 5, f"{depth:g} m")
             depth += step
 
+        unit_geometry = []
         for unit in self.units:
             start = _number(unit.get("z_suht_ylemine"))
             end = _number(unit.get("z_suht_alumine"))
@@ -1436,6 +1491,27 @@ class ProfileWidget(QWidget):
             painter.fillRect(bar_left, round(y1), self.BAR_WIDTH, height, color)
             painter.setPen(QPen(QColor("#454545"), 1))
             painter.drawRect(bar_left, round(y1), self.BAR_WIDTH, height)
+            unit_geometry.append((unit, y1, height))
+
+        if self.show_boundary_depths:
+            guide_end = (
+                lithology_left - 6
+                if self.show_lithology
+                else layout["content_right"]
+            )
+            guide_pen = QPen(QColor(82, 91, 99, 62), 1)
+            painter.setPen(guide_pen)
+            for depth in self._unit_boundary_depths(max_depth):
+                y = round(depth_y(depth))
+                depth_text = f"{depth:g} m"
+                guide_start = (
+                    bar_left + self.BAR_WIDTH + 8
+                    + painter.fontMetrics().horizontalAdvance(depth_text) + 5
+                )
+                painter.drawLine(round(guide_start), y, round(guide_end), y)
+
+        for unit, y1, height in unit_geometry:
+            painter.setPen(QColor("#454545"))
             index = _unit_index(unit)
             lithology = unit.get("litoloogia") or unit.get("litoloogia_orig") or ""
             if index and height >= 8:
@@ -1518,32 +1594,31 @@ class ProfileWidget(QWidget):
 
         if self.show_samples:
             self._draw_intervals(
-                painter, self.samples, sample_left, QColor("#4f9b61"),
+                painter, self.samples, tracks["samples"], QColor("#4f9b61"),
                 self.TOP_MARGIN, draw_height, max_depth,
             )
         if self.show_analyses:
             self._draw_intervals(
-                painter, self.analyses, analysis_left, QColor("#8b4a9b"),
+                painter, self.analyses, tracks["analyses"], QColor("#8b4a9b"),
                 self.TOP_MARGIN, draw_height, max_depth,
             )
         if self.show_sarv_samples:
             self._draw_intervals(
-                painter, self.sarv_samples, sarv_sample_left, QColor("#267d92"),
+                painter, self.sarv_samples, tracks["sarv_samples"], QColor("#267d92"),
                 self.TOP_MARGIN, draw_height, max_depth, sarv=True,
             )
         if self.show_sarv_analyses:
             self._draw_intervals(
-                painter, self.sarv_analyses, sarv_analysis_left, QColor("#c06b25"),
+                painter, self.sarv_analyses, tracks["sarv_analyses"], QColor("#c06b25"),
                 self.TOP_MARGIN, draw_height, max_depth, sarv=True,
             )
         if self.show_sarv_specimens:
             self._draw_intervals(
-                painter, self.sarv_specimens, sarv_specimen_left, QColor("#b23a62"),
+                painter, self.sarv_specimens, tracks["sarv_specimens"], QColor("#b23a62"),
                 self.TOP_MARGIN, draw_height, max_depth, sarv=True,
             )
-    def _draw_boundary_depth_labels(
-        self, painter, depth_y, max_depth, bar_left, draw_height,
-    ):
+
+    def _unit_boundary_depths(self, max_depth):
         depths = []
         for unit in self.units:
             for key in ("z_suht_ylemine", "z_suht_alumine"):
@@ -1553,7 +1628,12 @@ class ProfileWidget(QWidget):
                 depth = _number(raw)
                 if 0 <= depth <= max_depth:
                     depths.append(round(depth, 4))
-        depths = sorted(set(depths))
+        return sorted(set(depths))
+
+    def _draw_boundary_depth_labels(
+        self, painter, depth_y, max_depth, bar_left, draw_height,
+    ):
+        depths = self._unit_boundary_depths(max_depth)
         if not depths:
             return
 

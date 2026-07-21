@@ -1,4 +1,4 @@
-# Qeoloog 3.11.0
+# Qeoloog 3.12.0
 
 Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
 geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
@@ -20,6 +20,9 @@ Validated EGT–SARV link corrections can associate an EGT object with a SARV
 drill core, locality or research site. They are stored locally, applied
 immediately to the combined detail view, restored to the original GEA link and
 exported together as CSV or JSON.
+The geological profile draws subtle boundary guides from each boundary-depth
+label towards the lithology column. Hidden P, A, SP, SA and SE tracks are also
+removed from the horizontal layout so the profile becomes more compact.
 
 ## Tööriistariba
 
@@ -158,6 +161,12 @@ rajale. Sügavuseta kirjeid läbilõikele ei paigutata.
 Läbilõiget saab vertikaalselt suumida Windowsis `Ctrl` + kerimisratas ja macOS-is
 `Command` + kerimisratas. Tulba laius ei muutu. Uue objekti avamisel jääb viimati
 valitud andmepaan avatuks.
+
+Litoloogiliste üksuste piirid jätkuvad piiri sügavuse väärtusest paremale õrna
+juhtjoonena kuni litoloogia veeruni. Juhtjooned jäävad tekstide, proovide,
+analüüside ja eksemplaride taha. P, A, SP, SA ja SE raja väljalülitamisel
+eemaldatakse ka selle veeru ruum ning läbilõige muutub horisontaalselt
+kompaktsemaks.
 
 Läbilõike stratigraafia, litoloogia ja sügavuste esmase allika saab **Kihid**
 paanis valida. **WFS** laadib kiiremini; **API** saab GEA uuendused üldjuhul
