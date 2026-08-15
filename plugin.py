@@ -12,7 +12,6 @@ from qgis.PyQt.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixm
 from qgis.PyQt.QtWidgets import QMenu, QToolButton
 from qgis.core import (
     Qgis,
-    QgsCategorizedSymbolRenderer,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsCsException,
@@ -20,6 +19,7 @@ from qgis.core import (
     QgsFeature,
     QgsFeatureRequest,
     QgsField,
+    QgsGraduatedSymbolRenderer,
     QgsExpressionContextUtils,
     QgsGeometry,
     QgsMarkerSymbol,
@@ -28,20 +28,53 @@ from qgis.core import (
     QgsPointXY,
     QgsRasterLayer,
     QgsRectangle,
-    QgsRendererCategory,
+    QgsRendererRange,
     QgsRuleBasedRenderer,
     QgsTextBufferSettings,
     QgsTextFormat,
     QgsVectorLayer,
     QgsVectorLayerSimpleLabeling,
 )
-from qgis.gui import QgsHighlight
+from qgis.gui import QgsHighlight, QgsRubberBand
 
+from .corrections import (
+    apply_core_values,
+    changed_core_values,
+    core_correction_key,
+    core_record_id,
+    core_values,
+)
 from .dock import QeoloogDock
 from .i18n import GROUP_LABELS, translate
-from .identify import EgtIdentifyTool
+from .identify import CrossSectionLineTool, EgtIdentifyTool, ExportAreaTool
 from .models import DEFAULT_GROUP_STATE, GROUPS, PluginSettings
 from .network import NetworkClient
+from .veka import (
+    FILTER_CONSTRUCTION_TYPES,
+    aggregate as veka_aggregate,
+    analysis_codes,
+    analysis_matches as veka_analysis_matches,
+    analysis_options as veka_analysis_options,
+    analysis_row_value,
+    cadastral_number as veka_cadastral_number,
+    construction_category,
+    converted_result as veka_converted_result,
+    split_analysis_key,
+    equal_breaks,
+    group_rows,
+    hydro_matches as veka_hydro_matches,
+    interval_intersects,
+    kotkas_registry_url,
+    latest_static_water_level,
+    merge_water_analyses,
+    number as veka_number,
+    normalized_analysis_number,
+    parse_kotkas_protocols,
+    parse_kotkas_report_registry,
+    parse_veka_water_analyses,
+    quantile_breaks,
+    specific_capacity,
+)
 
 
 class QeoloogPlugin:
@@ -83,6 +116,13 @@ class QeoloogPlugin:
         9: ("poleerlihv", "polished slab"),
     }
     AK_CORRECTED_EXTENT = QgsRectangle(369548.1875, 6380032.5, 739208.1875, 6653113.0)
+    VEKA_MAIN_FIELDS = (
+        "id", "tyyp", "tyyp_selg", "nimi", "keht_staatus", "kkr_kood",
+        "maayksus", "maayksus_nimi", "katastri_nr", "pass_nr", "seire_nr",
+        "pohjaveekogum_id", "pohjaveekogum_nimi", "veekiht",
+        "veekiht_nimi", "aadress", "z_abs", "sygavus", "kasutus_selg",
+        "puur_aasta", "kesk_x", "kesk_y", "muut_aeg",
+    )
 
     def __init__(self, iface):
         self.iface = iface
@@ -106,6 +146,12 @@ class QeoloogPlugin:
         self.lk_button = None
         self.dock = None
         self.identify_tool = None
+        self.cross_section_line_tool = None
+        self.cross_section_map_band = None
+        self.cross_section_previous_tool = None
+        self.export_area_tool = None
+        self.export_area_band = None
+        self.export_area_previous_tool = None
         self.previous_map_tool = None
         self.selection_highlight = None
         self._changing_map_tool = False
@@ -135,6 +181,29 @@ class QeoloogPlugin:
         ]
         self._sarv_filter_generation = 0
         self.sarv_matches = PluginSettings.load_sarv_matches()
+        self.core_corrections = PluginSettings.load_core_corrections()
+        self.veka_style = PluginSettings.load_veka_style()
+        self._veka_rows = {}
+        self._veka_fids = {}
+        self._veka_loading = False
+        self._veka_aux = {
+            "construction": None,
+            "hydro": None,
+            "analysis_catalog": None,
+        }
+        self._veka_aux_loading = set()
+        self._veka_grouped = {}
+        self._veka_aux_waiters = {
+            "construction": [],
+            "hydro": [],
+            "analysis_catalog": [],
+        }
+        self._veka_analysis_rows = {}
+        self._veka_analysis_loading = set()
+        self._veka_analysis_waiters = {}
+        self._veka_analysis_grouped = {}
+        self._veka_filter_generation = 0
+        self._search_filter = None
 
     def t(self, text):
         return translate(text, self.language)
@@ -202,6 +271,105 @@ class QeoloogPlugin:
             f"Exported {len(rows)} SARV links to {target}."
             if self.language == "en" else
             f"Eksporditi {len(rows)} SARV seost faili {target}."
+        )
+        return target
+
+    def corrected_core_box(self, source, row):
+        """Apply a locally persisted correction to an upstream core-box row."""
+        key = core_correction_key(source, row)
+        correction = self.core_corrections.get(key, {})
+        changes = (
+            correction.get("changes", {})
+            if isinstance(correction, dict) else {}
+        )
+        return apply_core_values(source, row, changes)
+
+    def save_core_box_correction(
+        self, source, row, corrected, context=None,
+    ):
+        """Persist changed core-box values locally without touching upstream."""
+        key = core_correction_key(source, row)
+        if not key:
+            return False
+        original = core_values(source, row)
+        changes = changed_core_values(original, corrected or {})
+        if not changes:
+            self.core_corrections.pop(key, None)
+        else:
+            context = context or {}
+            self.core_corrections[key] = {
+                "source": str(source).upper(),
+                "record_id": core_record_id(source, row),
+                "parent_role": context.get("parent_role") or "",
+                "parent_id": context.get("parent_id") or "",
+                "parent_name": context.get("parent_name") or "",
+                "original": original,
+                "changes": changes,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        PluginSettings.save_core_corrections(self.core_corrections)
+        if self.dock and hasattr(self.dock, "export"):
+            self.dock.export.refresh_corrections_count()
+        return bool(changes)
+
+    def reset_core_box_correction(self, source, row):
+        key = core_correction_key(source, row)
+        if not key or key not in self.core_corrections:
+            return False
+        self.core_corrections.pop(key, None)
+        PluginSettings.save_core_corrections(self.core_corrections)
+        if self.dock and hasattr(self.dock, "export"):
+            self.dock.export.refresh_corrections_count()
+        return True
+
+    def export_core_corrections(self, path):
+        """Export all local drill-core box corrections as JSON or CSV."""
+        records = [
+            value for _, value in sorted(self.core_corrections.items())
+            if isinstance(value, dict)
+        ]
+        target = Path(path)
+        if target.suffix.casefold() == ".json":
+            target.write_text(
+                json.dumps({
+                    "format": "Qeoloog local drill-core box corrections",
+                    "version": 1,
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "corrections": records,
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            if target.suffix.casefold() != ".csv":
+                target = target.with_suffix(".csv")
+            rows = []
+            for record in records:
+                original = record.get("original", {})
+                for field, corrected in record.get("changes", {}).items():
+                    rows.append({
+                        "source": record.get("source") or "",
+                        "record_id": record.get("record_id") or "",
+                        "parent_role": record.get("parent_role") or "",
+                        "parent_id": record.get("parent_id") or "",
+                        "parent_name": record.get("parent_name") or "",
+                        "field": field,
+                        "original_value": original.get(field),
+                        "corrected_value": corrected,
+                        "updated_at": record.get("updated_at") or "",
+                    })
+            fieldnames = (
+                "source", "record_id", "parent_role", "parent_id",
+                "parent_name", "field", "original_value",
+                "corrected_value", "updated_at",
+            )
+            with target.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+        self.success(
+            f"Exported {len(records)} core-box corrections to {target}."
+            if self.language == "en" else
+            f"Eksporditi {len(records)} puursüdamiku parandust faili {target}."
         )
         return target
 
@@ -333,6 +501,41 @@ class QeoloogPlugin:
         self.toolbar.setObjectName("Qeoloog_Toolbar")
         self._create_dock()
         self.identify_tool = EgtIdentifyTool(self.iface.mapCanvas(), self)
+        self.cross_section_line_tool = CrossSectionLineTool(
+            self.iface.mapCanvas()
+        )
+        self.cross_section_line_tool.lineFinished.connect(
+            self._cross_section_line_finished
+        )
+        self.cross_section_line_tool.cancelled.connect(
+            self._cross_section_line_cancelled
+        )
+        self.cross_section_map_band = QgsRubberBand(
+            self.iface.mapCanvas(), Qgis.GeometryType.Line
+        )
+        self.cross_section_map_band.setColor(QColor("#d04432"))
+        self.cross_section_map_band.setWidth(3)
+        self.cross_section_map_band.setZValue(9999)
+        self.cross_section_map_band.hide()
+        self.export_area_tool = ExportAreaTool(self.iface.mapCanvas())
+        self.export_area_tool.areaFinished.connect(
+            self._export_area_finished
+        )
+        self.export_area_tool.cancelled.connect(
+            self._export_area_cancelled
+        )
+        self.export_area_band = QgsRubberBand(
+            self.iface.mapCanvas(), Qgis.GeometryType.Polygon
+        )
+        self.export_area_band.setColor(QColor(53, 132, 228, 45))
+        self.export_area_band.setStrokeColor(QColor("#3584e4"))
+        self.export_area_band.setWidth(2)
+        self.export_area_band.setZValue(9998)
+        self.export_area_band.hide()
+        QTimer.singleShot(0, self.dock.cross_sections.refresh)
+        QTimer.singleShot(
+            0, self.dock.cross_sections.backfill_egt_elevations
+        )
         project = QgsProject.instance()
         project.layersAdded.connect(self._project_layers_changed)
         project.layersRemoved.connect(self._project_layers_changed)
@@ -364,8 +567,27 @@ class QeoloogPlugin:
             self._changing_map_tool = True
             self.iface.mapCanvas().unsetMapTool(self.identify_tool)
             self._changing_map_tool = False
+        if (
+            self.cross_section_line_tool
+            and self.iface.mapCanvas().mapTool()
+            is self.cross_section_line_tool
+        ):
+            self.iface.mapCanvas().unsetMapTool(self.cross_section_line_tool)
+        if (
+            self.export_area_tool
+            and self.iface.mapCanvas().mapTool() is self.export_area_tool
+        ):
+            self.iface.mapCanvas().unsetMapTool(self.export_area_tool)
+        if self.cross_section_map_band:
+            self.cross_section_map_band.reset(Qgis.GeometryType.Line)
+            self.cross_section_map_band.hide()
+        if self.export_area_band:
+            self.export_area_band.reset(Qgis.GeometryType.Polygon)
+            self.export_area_band.hide()
         self._clear_actions()
         if self.dock:
+            self.dock.export.cancel_pending()
+            self.dock.close_cross_sections()
             self.iface.removeDockWidget(self.dock)
             self.dock.deleteLater()
             self.dock = None
@@ -374,6 +596,12 @@ class QeoloogPlugin:
             self.toolbar.deleteLater()
             self.toolbar = None
         self.identify_tool = None
+        self.cross_section_line_tool = None
+        self.cross_section_map_band = None
+        self.cross_section_previous_tool = None
+        self.export_area_tool = None
+        self.export_area_band = None
+        self.export_area_previous_tool = None
 
     # ---- Toolbar, additional-layer menu and configuration -------------------------
 
@@ -408,7 +636,7 @@ class QeoloogPlugin:
         )
         self.identify_action.setCheckable(True)
         self.identify_action.setToolTip(
-            self.t("Klõpsa EGT või SARV punktil ja ava seotud andmed")
+            self.t("Klõpsa EGT, SARV või VEKA punktil ja ava seotud andmed")
         )
         self.identify_action.toggled.connect(self.set_identify_active)
         self._register_action(self.identify_action)
@@ -419,7 +647,7 @@ class QeoloogPlugin:
             self._code_icon("⚙", "#555f69"), self.t("Seadista Qeoloogi"), self.iface.mainWindow()
         )
         self.configure_action.setToolTip(
-            self.t("Lisa, muuda või eemalda WMS/WFS/SARV kihte")
+            self.t("Lisa, muuda või eemalda WMS/WFS/SARV/VEKA kihte")
         )
         self.configure_action.triggered.connect(self.show_configuration)
         self._register_action(self.configure_action)
@@ -624,6 +852,9 @@ class QeoloogPlugin:
     def _sync_project_layers(self):
         self.sync_dropdown_checks()
         self._ensure_egt_points_on_top()
+        if self.dock:
+            self.dock.cross_sections.reload_rasters()
+            self.dock.cross_sections.backfill_egt_elevations()
 
     def sync_dropdown_checks(self):
         loaded = {self._layer_source_id(layer) for layer in QgsProject.instance().mapLayers().values()}
@@ -705,6 +936,8 @@ class QeoloogPlugin:
     def add_layer(self, definition, force_add=False):
         if definition.role == "sarv_points":
             return self._add_sarv_point_layers(definition, force_add)
+        if definition.role == "veka_boreholes":
+            return self._add_veka_layer(definition, force_add)
 
         source_id = self._source_id(definition)
         name = self.display_name(definition)
@@ -775,6 +1008,14 @@ class QeoloogPlugin:
             layer for layer in project.mapLayers().values()
             if self._layer_source_id(layer) == source_id
         ]
+        if (
+            existing and not self._veka_rows
+            and all(layer.dataProvider().featureCount() == 0 for layer in existing)
+        ):
+            self._remove_layers_and_empty_groups(
+                [layer.id() for layer in existing]
+            )
+            existing = []
         if existing:
             if self.toggle_mode and not force_add:
                 self._remove_layers_and_empty_groups(
@@ -946,6 +1187,180 @@ class QeoloogPlugin:
         self.apply_sarv_filters()
         self.sync_dropdown_checks()
 
+    def _add_veka_layer(self, definition, force_add=False):
+        """Load EELIS/VEKA wells as a locally filterable memory layer."""
+        source_id = self._source_id(definition)
+        project = QgsProject.instance()
+        existing = [
+            layer for layer in project.mapLayers().values()
+            if self._layer_source_id(layer) == source_id
+        ]
+        if existing:
+            if self.toggle_mode and not force_add:
+                project.removeMapLayers([layer.id() for layer in existing])
+                self._veka_fids = {}
+                self.success(
+                    f"{self.display_name(definition)} "
+                    + ("removed." if self.language == "en" else "eemaldatud.")
+                )
+                return False
+            for layer in existing:
+                node = project.layerTreeRoot().findLayer(layer.id())
+                if node:
+                    node.setItemVisibilityChecked(True)
+            self.iface.setActiveLayer(existing[0])
+            return True
+        if self._veka_loading:
+            self.message(
+                "VEKA wells are already loading..." if self.language == "en"
+                else "VEKA puurkaevud juba laadivad..."
+            )
+            return True
+        if self._veka_rows:
+            self._create_veka_layer(definition, list(self._veka_rows.values()))
+            return True
+
+        self._veka_loading = True
+        if self.dock:
+            self.dock.veka.status.setText(
+                self.t("VEKA puurkaeve laaditakse…")
+            )
+        self.message(self.t("VEKA puurkaeve laaditakse…"))
+
+        def loaded(rows):
+            self._veka_loading = False
+            self._create_veka_layer(definition, rows)
+
+        def failed(error):
+            self._veka_loading = False
+            if self.dock:
+                self.dock.veka.status.setText(str(error))
+            self.error(
+                f"Could not load VEKA wells: {error}" if self.language == "en"
+                else f"VEKA puurkaevude laadimine ebaõnnestus: {error}"
+            )
+
+        self.network.query_eelis_pages(
+            "f_puuraugud", {}, self.VEKA_MAIN_FIELDS, loaded, failed,
+        )
+        return True
+
+    def _create_veka_layer(self, definition, rows):
+        source_id = self._source_id(definition)
+        if any(
+            self._layer_source_id(layer) == source_id
+            for layer in QgsProject.instance().mapLayers().values()
+        ):
+            return
+        layer = QgsVectorLayer(
+            "Point?crs=EPSG:3301", self.display_name(definition), "memory"
+        )
+        layer.setCustomProperty(self.SOURCE_PROPERTY, source_id)
+        layer.setCustomProperty(self.ROLE_PROPERTY, "veka_boreholes")
+        provider = layer.dataProvider()
+        fields = (
+            ("eelis_id", QVariant.LongLong), ("tyyp", QVariant.String),
+            ("otstarve", QVariant.String), ("nimi", QVariant.String),
+            ("staatus", QVariant.String), ("kkr_kood", QVariant.String),
+            ("maayksus", QVariant.String), ("maa_nimi", QVariant.String),
+            ("katastri_nr", QVariant.String), ("pass_nr", QVariant.String),
+            ("seire_nr", QVariant.String), ("pvk_id", QVariant.LongLong),
+            ("pvk_nimi", QVariant.String), ("veekiht", QVariant.String),
+            ("veekiht_nimi", QVariant.String), ("aadress", QVariant.String),
+            ("z_abs", QVariant.Double), ("sygavus", QVariant.Double),
+            ("kasutus", QVariant.String), ("puur_aasta", QVariant.Int),
+            ("muut_aeg", QVariant.String), ("vk_match", QVariant.Int),
+            ("vk_style", QVariant.Double),
+        )
+        provider.addAttributes([QgsField(name, field_type) for name, field_type in fields])
+        layer.updateFields()
+        usable_rows = {}
+        features = []
+        for row in rows:
+            identifier = row.get("id")
+            x, y = veka_number(row.get("kesk_x")), veka_number(row.get("kesk_y"))
+            if identifier in (None, "") or x is None or y is None:
+                continue
+            if not (300000 <= x <= 850000 and 6300000 <= y <= 6700000):
+                continue
+            feature = QgsFeature(layer.fields())
+            feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+            feature.setAttributes([
+                identifier, row.get("tyyp"), row.get("tyyp_selg"),
+                row.get("nimi"), row.get("keht_staatus"), row.get("kkr_kood"),
+                row.get("maayksus"), row.get("maayksus_nimi"),
+                row.get("katastri_nr"), row.get("pass_nr"), row.get("seire_nr"),
+                row.get("pohjaveekogum_id"), row.get("pohjaveekogum_nimi"),
+                row.get("veekiht"), row.get("veekiht_nimi"), row.get("aadress"),
+                veka_number(row.get("z_abs")), veka_number(row.get("sygavus")),
+                row.get("kasutus_selg"), row.get("puur_aasta"),
+                row.get("muut_aeg"), 1, None,
+            ])
+            features.append(feature)
+            usable_rows[str(identifier)] = dict(row)
+            if len(features) >= 4000:
+                provider.addFeatures(features)
+                features = []
+        if features:
+            provider.addFeatures(features)
+        layer.updateExtents()
+        self._veka_rows = usable_rows
+        self._veka_fids = {
+            str(feature["eelis_id"]): int(feature.id())
+            for feature in layer.getFeatures()
+        }
+        self._apply_veka_default_renderer(layer)
+        self._apply_name_labeling(layer, "nimi")
+        project = QgsProject.instance()
+        project.addMapLayer(layer, False)
+        project.layerTreeRoot().insertLayer(0, layer)
+        self._ensure_egt_points_on_top(layer)
+        self.iface.setActiveLayer(layer)
+        purposes = sorted({
+            (str(row.get("tyyp")), str(row.get("tyyp_selg") or row.get("tyyp")))
+            for row in usable_rows.values() if row.get("tyyp") not in (None, "")
+        }, key=lambda item: item[1].casefold())
+        groundwater = sorted({
+            (str(row.get("pohjaveekogum_id")), str(row.get("pohjaveekogum_nimi")))
+            for row in usable_rows.values()
+            if row.get("pohjaveekogum_id") not in (None, "")
+            and row.get("pohjaveekogum_nimi") not in (None, "")
+        }, key=lambda item: item[1].casefold())
+        if self.dock:
+            self.dock.veka.set_main_options(purposes, groundwater)
+            self.dock.veka.status.setText(
+                f"{len(usable_rows)} {self.t('VEKA puurkaevu valmis')}"
+            )
+        self.apply_veka_filters()
+        if self.veka_style:
+            QTimer.singleShot(
+                0,
+                lambda settings=dict(self.veka_style):
+                self.apply_veka_symbology(settings),
+            )
+        self.sync_dropdown_checks()
+        self.success(
+            f"Loaded {len(usable_rows)} VEKA wells."
+            if self.language == "en" else
+            f"Laaditi {len(usable_rows)} VEKA puurkaevu."
+        )
+
+    @staticmethod
+    def _apply_veka_default_renderer(layer):
+        symbol = QgsMarkerSymbol.createSimple({
+            "name": "circle", "color": "#2876a8",
+            "outline_color": "#ffffff", "outline_width": "0.35",
+            "size": "2.7",
+        })
+        renderer = layer.renderer()
+        if hasattr(renderer, "setSymbol"):
+            renderer.setSymbol(symbol)
+        else:
+            root = QgsRuleBasedRenderer.Rule(None)
+            root.appendChild(QgsRuleBasedRenderer.Rule(symbol))
+            layer.setRenderer(QgsRuleBasedRenderer(root))
+        layer.triggerRepaint()
+
     def _remove_layers_and_empty_groups(self, layer_ids):
         project = QgsProject.instance()
         root = project.layerTreeRoot()
@@ -1085,13 +1500,22 @@ class QeoloogPlugin:
 
     def _refresh_loaded_plugin_layers(self):
         definitions = {self._source_id(item): item for item in self.definitions}
-        for layer in QgsProject.instance().mapLayers().values():
+        reload_veka = {}
+        project = QgsProject.instance()
+        for layer in list(project.mapLayers().values()):
             definition = definitions.get(self._layer_source_id(layer))
             adopted = False
             if not definition:
                 definition = self._definition_from_wfs_source(layer)
                 adopted = definition is not None
             if not definition:
+                continue
+            if definition.role == "veka_boreholes" and not self._veka_rows:
+                # A memory layer restored from a project does not rebuild the
+                # related-data indexes needed by VEKA filters and styling.
+                # Replace it with a fresh API-backed layer once per source.
+                reload_veka[self._source_id(definition)] = definition
+                project.removeMapLayer(layer.id())
                 continue
             if adopted:
                 # Older projects can contain a Qeoloog WFS layer whose custom
@@ -1106,6 +1530,10 @@ class QeoloogPlugin:
                     if definition.role == "boreholes":
                         self._apply_borehole_labeling(layer)
             self._apply_layer_workarounds(layer, definition)
+        for definition in reload_veka.values():
+            QTimer.singleShot(
+                0, lambda item=definition: self._add_veka_layer(item, True)
+            )
         self.sync_dropdown_checks()
         self._ensure_egt_points_on_top()
 
@@ -1144,7 +1572,7 @@ class QeoloogPlugin:
     def _ensure_egt_points_on_top(self, preferred=None):
         project = QgsProject.instance()
         root = project.layerTreeRoot()
-        point_roles = {"boreholes", "observations"}
+        point_roles = {"boreholes", "observations", "veka_boreholes"}
         point_layers = [
             layer for layer in project.mapLayers().values()
             if self._layer_role(layer) in point_roles
@@ -1317,8 +1745,24 @@ class QeoloogPlugin:
         project = QgsProject.instance()
         for role, visible in visibility.items():
             for layer in self._role_layers(role):
+                # EGT point layers are remote WFS layers.  Applying a search
+                # result as an ``IN`` subset can create a many-kilobyte WFS
+                # request (even a single broad index may match hundreds of
+                # boreholes), which the server rejects as excessive load.
+                # Keep only the compact category predicate server-side and
+                # evaluate related-data and search-result membership locally
+                # through the rule renderer's layer variable.
+                search_expression = self._search_filter_clause(layer, role)
+                local_expressions = [
+                    expression for expression in (
+                        related_expression, search_expression,
+                    ) if expression
+                ]
+                local_expression = " AND ".join(
+                    f"({expression})" for expression in local_expressions
+                )
                 layer.setSubsetString(category_expression)
-                self._apply_category_renderer(layer, related_expression)
+                self._apply_category_renderer(layer, local_expression)
                 if role == "boreholes":
                     self._apply_borehole_labeling(layer)
                 node = project.layerTreeRoot().findLayer(layer.id())
@@ -1588,7 +2032,11 @@ class QeoloogPlugin:
         for role, role_layers in layers.items():
             visible = role in requirements["kinds"]
             for layer in role_layers:
-                layer.setSubsetString(base_expression)
+                layer.setSubsetString(
+                    self._with_search_filter(
+                        layer, role, base_expression
+                    )
+                )
                 node = project.layerTreeRoot().findLayer(layer.id())
                 if node:
                     node.setItemVisibilityChecked(visible)
@@ -1695,7 +2143,9 @@ class QeoloogPlugin:
                     f"({clause})" for clause in clauses if clause and clause != "TRUE"
                 )
                 for layer in role_layers:
-                    layer.setSubsetString(expression)
+                    layer.setSubsetString(
+                        self._with_search_filter(layer, role, expression)
+                    )
                     layer.triggerRepaint()
 
         def load_condition(index):
@@ -1836,12 +2286,787 @@ class QeoloogPlugin:
 
         load_condition(0)
 
-    # ---- Shared EGT/SARV search ---------------------------------------------------
+    # ---- VEKA filters and symbology ----------------------------------------------
+
+    def _ensure_veka_aux(self, kind, callback):
+        if self._veka_aux.get(kind) is not None:
+            callback(self._veka_aux[kind])
+            return
+        self._veka_aux_waiters[kind].append(callback)
+        if kind in self._veka_aux_loading:
+            return
+        self._veka_aux_loading.add(kind)
+        config = {
+            "construction": (
+                "f_puuraugud_konstruktsioon",
+                {"konstr_tyyp": "in.(" + ",".join(sorted(FILTER_CONSTRUCTION_TYPES)) + ")"},
+                ("konstr_puurauk_id", "konstr_tyyp", "alg", "lopp"),
+            ),
+            "hydro": (
+                "f_puuraugud_puurauk_param", {"deebit": "not.is.null"},
+                ("param_puurauk_id", "deebit", "alandus", "katse_kp"),
+            ),
+            "analysis_catalog": (
+                "f_veenaitajad_W10_W1_public",
+                {"katastri_number": "not.is.null", "naitaja_tulem": "not.is.null"},
+                ("naitaja_kood", "naitaja_nimi", "naitaja_yhik"),
+            ),
+        }[kind]
+        if self.dock:
+            self.dock.veka.status.setText(
+                self.t("VEKA seotud andmeid laaditakse…")
+            )
+
+        def loaded(rows):
+            self._veka_aux_loading.discard(kind)
+            self._veka_aux[kind] = list(rows)
+            self._veka_grouped.pop(kind, None)
+            waiters, self._veka_aux_waiters[kind] = self._veka_aux_waiters[kind], []
+            for waiter in waiters:
+                waiter(self._veka_aux[kind])
+
+        def failed(error):
+            self._veka_aux_loading.discard(kind)
+            self._veka_aux[kind] = []
+            self._veka_grouped.pop(kind, None)
+            waiters, self._veka_aux_waiters[kind] = self._veka_aux_waiters[kind], []
+            self.warning(
+                f"Could not load VEKA {kind} data: {error}"
+                if self.language == "en" else
+                f"VEKA andmete {kind} laadimine ebaõnnestus: {error}"
+            )
+            for waiter in waiters:
+                waiter([])
+
+        self.network.query_eelis_pages(
+            config[0], config[1], config[2], loaded, failed,
+        )
+
+    def _ensure_veka_analysis(self, code, callback):
+        """Load only the selected water-quality parameter and cache it."""
+        key = str(code or "")
+        parameter_codes = analysis_codes(key)
+        _, _, target_unit = split_analysis_key(key)
+        if not parameter_codes:
+            callback([])
+            return
+        if key in self._veka_analysis_rows:
+            callback(self._veka_analysis_rows[key])
+            return
+        self._veka_analysis_waiters.setdefault(key, []).append(callback)
+        if key in self._veka_analysis_loading:
+            return
+        self._veka_analysis_loading.add(key)
+        if self.dock:
+            self.dock.veka.status.setText(
+                self.t("VEKA seotud andmeid laaditakse…")
+            )
+
+        def completed(rows, error=None):
+            matching_rows = []
+            for row in rows:
+                value = analysis_row_value(row, key)
+                if value is None:
+                    continue
+                prepared = dict(row)
+                prepared["_qeoloog_value"] = value
+                prepared["_qeoloog_unit"] = target_unit
+                matching_rows.append(prepared)
+            self._veka_analysis_loading.discard(key)
+            self._veka_analysis_rows[key] = matching_rows
+            self._veka_analysis_grouped.pop(key, None)
+            waiters = self._veka_analysis_waiters.pop(key, [])
+            if error:
+                self.warning(
+                    f"Could not load VEKA analysis data: {error}"
+                    if self.language == "en" else
+                    f"VEKA analüüsiandmete laadimine ebaõnnestus: {error}"
+                )
+            for waiter in waiters:
+                waiter(self._veka_analysis_rows[key])
+
+        fields = (
+            "katastri_number", "analyys_number", "proov_algus",
+            "proov_sygavus", "naitaja_kood", "naitaja_tulem",
+            "naitaja_nimi", "naitaja_yhik",
+        )
+
+        def load_code(index, collected):
+            if index >= len(parameter_codes):
+                completed(collected)
+                return
+            self.network.query_eelis_pages(
+                "f_veenaitajad_W10_W1_public",
+                {
+                    "katastri_number": "not.is.null",
+                    "naitaja_tulem": "not.is.null",
+                    "naitaja_kood": f"eq.{parameter_codes[index]}",
+                },
+                fields,
+                lambda rows: load_code(index + 1, collected + list(rows)),
+                lambda error: completed([], error),
+            )
+
+        load_code(0, [])
+
+    def _veka_analysis_group(self, code):
+        code = str(code or "")
+        if code not in self._veka_analysis_grouped:
+            self._veka_analysis_grouped[code] = group_rows(
+                self._veka_analysis_rows.get(code, []), "katastri_number",
+            )
+        return self._veka_analysis_grouped[code]
+
+    def _veka_group(self, kind):
+        if kind not in self._veka_grouped:
+            key = {
+                "construction": "konstr_puurauk_id",
+                "hydro": "param_puurauk_id",
+                "analyses": "katastri_number",
+            }[kind]
+            self._veka_grouped[kind] = group_rows(
+                self._veka_aux.get(kind) or [], key,
+            )
+        return self._veka_grouped[kind]
+
+    def ensure_veka_analysis_options(self):
+        if self.dock:
+            self.dock.veka.load_analysis.setEnabled(False)
+            self.dock.veka.status.setText(
+                self.t("Veeproovi näitajaid laaditakse…")
+            )
+
+        def ready(rows):
+            if self.dock:
+                options = veka_analysis_options(rows)
+                self.dock.veka.set_analysis_options(options)
+                self.dock.export.set_veka_analysis_options(options)
+                self.dock.veka.status.setText(
+                    self.t("Veeproovi näitajad on valmis.")
+                )
+
+        self._ensure_veka_aux("analysis_catalog", ready)
+
+    def apply_veka_filters(self):
+        if not self.dock:
+            return
+        layers = self._role_layers("veka_boreholes")
+        if not layers or not self._veka_rows:
+            self.dock.veka.status.setText(
+                self.t("Laadi VK kiht, et VEKA filtreid kasutada.")
+            )
+            return
+        requirements = self.dock.veka.requirements()
+        needed = []
+        if requirements["filter_min"] is not None or requirements["filter_max"] is not None:
+            needed.append("construction")
+        if any(
+            requirements[key] is not None
+            for key in ("debit_min", "debit_max", "specific_min", "specific_max")
+        ):
+            needed.append("hydro")
+        if requirements["analysis_code"]:
+            needed.append("analyses")
+        self._veka_filter_generation += 1
+        generation = self._veka_filter_generation
+
+        def ensure(index):
+            if generation != self._veka_filter_generation:
+                return
+            if index >= len(needed):
+                self._apply_veka_filters_ready(requirements, layers, generation)
+                return
+            kind = needed[index]
+            if kind == "analyses":
+                self._ensure_veka_analysis(
+                    requirements["analysis_code"], lambda rows: ensure(index + 1)
+                )
+            else:
+                self._ensure_veka_aux(kind, lambda rows: ensure(index + 1))
+
+        ensure(0)
+
+    def _apply_veka_filters_ready(self, requirements, layers, generation):
+        if generation != self._veka_filter_generation:
+            return
+        purpose = requirements["purposes"]
+        groundwater = requirements["groundwater"]
+        text = self._normalized(requirements["text"])
+        construction_active = (
+            requirements["filter_min"] is not None
+            or requirements["filter_max"] is not None
+        )
+        construction = self._veka_group("construction") if construction_active else {}
+        hydro_active = any(
+            requirements[key] is not None
+            for key in ("debit_min", "debit_max", "specific_min", "specific_max")
+        )
+        hydro = self._veka_group("hydro") if hydro_active else {}
+        analysis_active = bool(requirements["analysis_code"])
+        analyses = (
+            self._veka_analysis_group(requirements["analysis_code"])
+            if analysis_active else {}
+        )
+        matching = set()
+        for identifier, row in self._veka_rows.items():
+            if purpose and str(row.get("tyyp")) not in purpose:
+                continue
+            if groundwater and str(row.get("pohjaveekogum_id")) not in groundwater:
+                continue
+            year = veka_number(row.get("puur_aasta"))
+            if requirements["year_min"] is not None and (
+                year is None or year < requirements["year_min"]
+            ):
+                continue
+            if requirements["year_max"] is not None and (
+                year is None or year > requirements["year_max"]
+            ):
+                continue
+            if text:
+                haystack = self._normalized(" ".join(
+                    str(row.get(key) or "") for key in (
+                        "nimi", "kkr_kood", "katastri_nr", "pass_nr",
+                        "seire_nr", "aadress", "maayksus", "maayksus_nimi",
+                    )
+                ))
+                if text not in haystack:
+                    continue
+            if construction_active and not any(
+                interval_intersects(
+                    item.get("alg"), item.get("lopp"),
+                    requirements["filter_min"], requirements["filter_max"],
+                )
+                for item in construction.get(identifier, ())
+            ):
+                continue
+            if hydro_active and not veka_hydro_matches(
+                hydro.get(identifier, ()), requirements,
+            ):
+                continue
+            if analysis_active and not veka_analysis_matches(
+                analyses.get(str(row.get("katastri_nr") or "").strip(), ()),
+                requirements,
+            ):
+                continue
+            matching.add(identifier)
+        for layer in layers:
+            index = layer.fields().indexOf("vk_match")
+            if index < 0:
+                continue
+            changes = {
+                fid: {index: 1 if identifier in matching else 0}
+                for identifier, fid in self._veka_fids.items()
+            }
+            layer.dataProvider().changeAttributeValues(changes)
+            layer.setSubsetString(
+                self._with_search_filter(
+                    layer, "veka_boreholes", '"vk_match" = 1'
+                )
+            )
+            layer.triggerRepaint()
+        self.dock.veka.status.setText(
+            f"{len(matching)} / {len(self._veka_rows)} "
+            + self.t("VEKA puurkaevu nähtaval")
+        )
+
+    def _veka_metric_values(self, settings):
+        metric = settings.get("metric", "year")
+        mode = settings.get("aggregation", "latest")
+        values = {}
+        if metric in {"year", "depth"}:
+            field = "puur_aasta" if metric == "year" else "sygavus"
+            return {
+                identifier: veka_number(row.get(field))
+                for identifier, row in self._veka_rows.items()
+            }
+        if metric in {"filter_top", "filter_bottom"}:
+            grouped = self._veka_group("construction")
+            field = "alg" if metric == "filter_top" else "lopp"
+            effective_mode = (
+                "min" if metric == "filter_top" else "max"
+            ) if mode == "latest" else mode
+            for identifier in self._veka_rows:
+                values[identifier] = veka_aggregate(
+                    grouped.get(identifier, ()), lambda row: row.get(field),
+                    effective_mode,
+                )
+            return values
+        if metric in {"debit", "specific"}:
+            grouped = self._veka_group("hydro")
+            getter = (
+                (lambda row: row.get("deebit"))
+                if metric == "debit" else specific_capacity
+            )
+            for identifier in self._veka_rows:
+                values[identifier] = veka_aggregate(
+                    grouped.get(identifier, ()), getter, mode,
+                )
+            return values
+        key = str(settings.get("analysis_code") or "")
+        grouped = self._veka_analysis_group(key)
+        for identifier, row in self._veka_rows.items():
+            values[identifier] = veka_aggregate(
+                grouped.get(str(row.get("katastri_nr") or ""), ()),
+                lambda item: item.get("_qeoloog_value"), mode,
+                date_field="proov_algus",
+            )
+        return values
+
+    def apply_veka_symbology(self, settings):
+        layers = self._role_layers("veka_boreholes")
+        if not layers:
+            self.warning(
+                "Load the VK layer first." if self.language == "en"
+                else "Laadi esmalt VK kiht."
+            )
+            return
+        metric = settings.get("metric", "year")
+        if metric == "analysis" and not settings.get("analysis_code"):
+            self.warning(
+                "Select a water-quality parameter first."
+                if self.language == "en" else
+                "Vali esmalt veeproovi näitaja."
+            )
+            return
+        required = {
+            "filter_top": "construction", "filter_bottom": "construction",
+            "debit": "hydro", "specific": "hydro", "analysis": "analyses",
+        }.get(metric)
+        if required == "analyses":
+            code = str(settings.get("analysis_code") or "")
+            if code not in self._veka_analysis_rows:
+                self._ensure_veka_analysis(
+                    code, lambda rows: self.apply_veka_symbology(settings)
+                )
+                return
+        elif required and self._veka_aux.get(required) is None:
+            self._ensure_veka_aux(
+                required, lambda rows: self.apply_veka_symbology(settings)
+            )
+            return
+        values = self._veka_metric_values(settings)
+        usable = [value for value in values.values() if value is not None]
+        if not usable:
+            self.warning(
+                "No numeric values are available for this style."
+                if self.language == "en" else
+                "Selle kujunduse jaoks ei leitud arvulisi väärtusi."
+            )
+            return
+        minimum, maximum = min(usable), max(usable)
+        span = max(1.0, maximum - minimum)
+        sentinel = minimum - span * 0.05 - 1.0
+        for layer in layers:
+            index = layer.fields().indexOf("vk_style")
+            changes = {
+                fid: {index: values.get(identifier) if values.get(identifier) is not None else sentinel}
+                for identifier, fid in self._veka_fids.items()
+            }
+            layer.dataProvider().changeAttributeValues(changes)
+            renderer = self._veka_graduated_renderer(
+                usable, sentinel, settings,
+            )
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+        self.veka_style = dict(settings)
+        PluginSettings.save_veka_style(self.veka_style)
+        if self.dock:
+            self.dock.veka.status.setText(
+                self.t("VEKA kujundus rakendati.")
+            )
+
+    def _veka_graduated_renderer(self, values, sentinel, settings):
+        try:
+            classes = max(1, min(12, int(settings.get("classes", 5))))
+        except (TypeError, ValueError):
+            classes = 5
+        breaks = (
+            quantile_breaks(values, classes)
+            if settings.get("classification") == "quantile"
+            else equal_breaks(values, classes)
+        )
+        minimum = min(values)
+        try:
+            size_min = max(0.1, float(settings.get("size_min", 1.5)))
+            size_max = max(size_min, float(settings.get("size_max", 7.0)))
+        except (TypeError, ValueError):
+            size_min, size_max = 1.5, 7.0
+        palette = str(settings.get("palette") or "#440154|#fde725")
+        if "|" not in palette:
+            palette = "#440154|#fde725"
+        start_text, end_text = palette.split("|", 1)
+        start_color, end_color = QColor(start_text), QColor(end_text)
+        if not start_color.isValid() or not end_color.isValid():
+            start_color, end_color = QColor("#440154"), QColor("#fde725")
+        method = settings.get("method", "color")
+        ranges = []
+        missing_symbol = QgsMarkerSymbol.createSimple({
+            "name": "circle", "color": "#a9a9a9",
+            "outline_color": "#ffffff", "outline_width": "0.25",
+            "size": str(size_min if settings.get("show_missing", True) else 0.0),
+        })
+        ranges.append(QgsRendererRange(
+            sentinel, sentinel, missing_symbol, self.t("Andmed puuduvad"),
+        ))
+        lower = minimum
+        denominator = max(1, len(breaks) - 1)
+        for index, upper in enumerate(breaks):
+            fraction = index / denominator
+            color = QColor.fromRgbF(
+                start_color.redF() + (end_color.redF() - start_color.redF()) * fraction,
+                start_color.greenF() + (end_color.greenF() - start_color.greenF()) * fraction,
+                start_color.blueF() + (end_color.blueF() - start_color.blueF()) * fraction,
+                1.0,
+            )
+            size = size_min + (size_max - size_min) * fraction
+            symbol = QgsMarkerSymbol.createSimple({
+                "name": "circle",
+                "color": color.name() if method in {"color", "both"} else "#2876a8",
+                "outline_color": "#ffffff", "outline_width": "0.3",
+                "size": str(size if method in {"size", "both"} else 2.7),
+            })
+            label = f"{lower:.4g} – {upper:.4g}"
+            ranges.append(QgsRendererRange(lower, upper, symbol, label))
+            lower = upper
+        return QgsGraduatedSymbolRenderer("vk_style", ranges)
+
+    def reset_veka_symbology(self):
+        for layer in self._role_layers("veka_boreholes"):
+            self._apply_veka_default_renderer(layer)
+            self._apply_name_labeling(layer, "nimi")
+        self.veka_style = {}
+        PluginSettings.save_veka_style({})
+        if self.dock:
+            self.dock.veka.status.setText(self.t("VEKA algkujundus taastati."))
+
+    @staticmethod
+    def veka_construction_category(code):
+        return construction_category(code)
+
+    @staticmethod
+    def veka_specific_capacity(row):
+        return specific_capacity(row)
+
+    @staticmethod
+    def veka_static_water_level(rows):
+        return latest_static_water_level(rows)
+
+    @staticmethod
+    def veka_analysis_result(row):
+        return veka_converted_result(
+            row.get("naitaja_tulem"),
+            row.get("naitaja_yhik"),
+            row.get("naitaja_nimi"),
+        )
+
+    # ---- Multi-well cross-sections -----------------------------------------------
+
+    def cross_section_contains(self, key):
+        return bool(
+            self.dock
+            and self.dock.cross_sections.contains(str(key))
+        )
+
+    def add_current_detail_to_cross_section(self):
+        if not self.dock:
+            return
+        snapshot = self.dock.details.cross_section_snapshot()
+        if snapshot:
+            self.dock.cross_sections.add_snapshot(snapshot)
+
+    def remove_cross_section_item(self, key):
+        if self.dock:
+            self.dock.cross_sections.remove_key(key)
+
+    def start_cross_section_line(self):
+        if not self.cross_section_line_tool:
+            return
+        canvas = self.iface.mapCanvas()
+        self.cross_section_previous_tool = canvas.mapTool()
+        canvas.setMapTool(self.cross_section_line_tool)
+        self.message(
+            "Click line vertices; right-click or Enter finishes."
+            if self.language == "en" else
+            "Klõpsa joone tipud; paremklõps või Enter lõpetab."
+        )
+
+    def _cross_section_line_finished(self, points):
+        canvas = self.iface.mapCanvas()
+        transformed = []
+        try:
+            transform = QgsCoordinateTransform(
+                canvas.mapSettings().destinationCrs(),
+                QgsCoordinateReferenceSystem("EPSG:3301"),
+                QgsProject.instance(),
+            )
+            for x, y in points:
+                point = transform.transform(QgsPointXY(float(x), float(y)))
+                transformed.append((point.x(), point.y()))
+        except (QgsCsException, TypeError, ValueError):
+            transformed = []
+        if transformed and self.dock:
+            self.dock.cross_sections.set_line(transformed)
+            self.dock.show_cross_sections()
+        self._restore_cross_section_map_tool()
+
+    def _cross_section_line_cancelled(self):
+        self._restore_cross_section_map_tool()
+
+    def _restore_cross_section_map_tool(self):
+        canvas = self.iface.mapCanvas()
+        if canvas.mapTool() is self.cross_section_line_tool:
+            if (
+                self.cross_section_previous_tool
+                and self.cross_section_previous_tool
+                is not self.cross_section_line_tool
+            ):
+                canvas.setMapTool(self.cross_section_previous_tool)
+            else:
+                canvas.unsetMapTool(self.cross_section_line_tool)
+        self.cross_section_previous_tool = None
+
+    def update_cross_section_map_line(self, points, visible=True):
+        if not self.cross_section_map_band:
+            return
+        self.cross_section_map_band.reset(Qgis.GeometryType.Line)
+        if not visible or len(points or ()) < 2:
+            self.cross_section_map_band.hide()
+            self.iface.mapCanvas().update()
+            return
+        try:
+            transform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:3301"),
+                self.iface.mapCanvas().mapSettings().destinationCrs(),
+                QgsProject.instance(),
+            )
+            for x, y in points:
+                point = transform.transform(QgsPointXY(float(x), float(y)))
+                self.cross_section_map_band.addPoint(point, False)
+            self.cross_section_map_band.updatePosition()
+            self.cross_section_map_band.show()
+            self.cross_section_map_band.update()
+            self.iface.mapCanvas().update()
+        except (QgsCsException, TypeError, ValueError):
+            self.cross_section_map_band.reset(Qgis.GeometryType.Line)
+            self.cross_section_map_band.hide()
+
+    # ---- Leapfrog export area ----------------------------------------------------
+
+    def start_export_area(self):
+        if not self.export_area_tool:
+            return
+        canvas = self.iface.mapCanvas()
+        self.export_area_previous_tool = canvas.mapTool()
+        canvas.setMapTool(self.export_area_tool)
+        self.message(
+            "Click polygon vertices; right-click or Enter finishes."
+            if self.language == "en" else
+            "Klõpsa ala tipud; paremklõps või Enter lõpetab."
+        )
+
+    def _export_area_finished(self, points):
+        canvas = self.iface.mapCanvas()
+        transformed = []
+        try:
+            transform = QgsCoordinateTransform(
+                canvas.mapSettings().destinationCrs(),
+                QgsCoordinateReferenceSystem("EPSG:3301"),
+                QgsProject.instance(),
+            )
+            for x, y in points:
+                point = transform.transform(QgsPointXY(float(x), float(y)))
+                transformed.append(QgsPointXY(point))
+        except (QgsCsException, TypeError, ValueError):
+            transformed = []
+        if len(transformed) >= 3 and self.dock:
+            if transformed[0] != transformed[-1]:
+                transformed.append(QgsPointXY(transformed[0]))
+            geometry = QgsGeometry.fromPolygonXY([transformed])
+            self.dock.export.set_area(
+                geometry, self.t("Kaardile joonistatud ala")
+            )
+            self.dock.tabs.setCurrentWidget(self.dock.export_page)
+            self.dock.show()
+            self.dock.raise_()
+        self._restore_export_area_map_tool()
+
+    def _export_area_cancelled(self):
+        self._restore_export_area_map_tool()
+
+    def _restore_export_area_map_tool(self):
+        canvas = self.iface.mapCanvas()
+        if canvas.mapTool() is self.export_area_tool:
+            if (
+                self.export_area_previous_tool
+                and self.export_area_previous_tool is not self.export_area_tool
+            ):
+                canvas.setMapTool(self.export_area_previous_tool)
+            else:
+                canvas.unsetMapTool(self.export_area_tool)
+        self.export_area_previous_tool = None
+
+    def update_export_area_band(self, geometry):
+        if not self.export_area_band:
+            return
+        self.export_area_band.reset(Qgis.GeometryType.Polygon)
+        if not geometry or geometry.isEmpty():
+            self.export_area_band.hide()
+            self.iface.mapCanvas().update()
+            return
+        display = QgsGeometry(geometry)
+        try:
+            display.transform(QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem("EPSG:3301"),
+                self.iface.mapCanvas().mapSettings().destinationCrs(),
+                QgsProject.instance(),
+            ))
+            self.export_area_band.setToGeometry(display, None)
+            self.export_area_band.show()
+            self.export_area_band.update()
+            self.iface.mapCanvas().update()
+        except QgsCsException:
+            self.export_area_band.reset(Qgis.GeometryType.Polygon)
+            self.export_area_band.hide()
+
+    @staticmethod
+    def _detail_attributes_with_location(
+        attributes, layer=None, feature=None,
+    ):
+        values = dict(attributes or {})
+        if layer is not None and feature is not None:
+            try:
+                source_point = feature.geometry().constGet()
+                elevation = veka_number(
+                    source_point.z()
+                    if source_point is not None
+                    and hasattr(source_point, "z") else None
+                )
+                if (
+                    elevation is not None
+                    and not any(
+                        values.get(key) not in (None, "", "NULL", "<NULL>")
+                        for key in ("z_abs", "elevation", "altitude", "height")
+                    )
+                ):
+                    # EGT publishes ground elevation as the Z coordinate of
+                    # its PointZ WFS geometry rather than as an attribute.
+                    values["z_abs"] = elevation
+            except (AttributeError, TypeError, ValueError):
+                pass
+        if (
+            values.get("_qeoloog_x_3301") not in (None, "")
+            and values.get("_qeoloog_y_3301") not in (None, "")
+        ):
+            return values
+        if layer is not None and feature is not None:
+            try:
+                geometry = QgsGeometry(feature.geometry())
+                geometry.transform(QgsCoordinateTransform(
+                    layer.crs(),
+                    QgsCoordinateReferenceSystem("EPSG:3301"),
+                    QgsProject.instance(),
+                ))
+                point = geometry.asPoint()
+                values["_qeoloog_x_3301"] = point.x()
+                values["_qeoloog_y_3301"] = point.y()
+                return values
+            except (QgsCsException, TypeError, ValueError):
+                pass
+        longitude = values.get("_qeoloog_longitude")
+        latitude = values.get("_qeoloog_latitude")
+        if longitude not in (None, "") and latitude not in (None, ""):
+            try:
+                point = QgsCoordinateTransform(
+                    QgsCoordinateReferenceSystem("EPSG:4326"),
+                    QgsCoordinateReferenceSystem("EPSG:3301"),
+                    QgsProject.instance(),
+                ).transform(QgsPointXY(float(longitude), float(latitude)))
+                values["_qeoloog_x_3301"] = point.x()
+                values["_qeoloog_y_3301"] = point.y()
+            except (QgsCsException, TypeError, ValueError):
+                pass
+        return values
+
+    # ---- Shared EGT/SARV/VEKA search --------------------------------------------
+
+    @staticmethod
+    def _search_roles(criteria):
+        source = criteria.get("source", "both")
+        roles = set()
+        if source in {"all", "both", "egt"}:
+            roles.update(("boreholes", "observations"))
+        if source in {"all", "both", "sarv"}:
+            roles.update((
+                "sarv_localities", "sarv_sites", "sarv_drillcores",
+            ))
+        if source in {"all", "veka"}:
+            roles.add("veka_boreholes")
+        selected = criteria.get("kinds")
+        return roles if selected is None else roles.intersection(selected)
+
+    def apply_search_filter(self, rows, criteria):
+        """Limit searched layer roles to the current result identifiers."""
+        roles = self._search_roles(criteria)
+        values = {role: set() for role in roles}
+        for row in rows:
+            role = row.get("_role")
+            value = row.get("_filter_id")
+            if role in values and value not in (None, ""):
+                values[role].add(str(value))
+        self._search_filter = {"roles": roles, "values": values}
+        self.apply_egt_filters()
+        self.apply_sarv_filters()
+        self.apply_veka_filters()
+
+    def clear_search_filter(self):
+        """Remove the transient search-result filter from all point layers."""
+        self._search_filter = None
+        self.apply_egt_filters()
+        self.apply_sarv_filters()
+        self.apply_veka_filters()
+
+    def _search_filter_clause(self, layer, role):
+        active = self._search_filter
+        if not active or role not in active["roles"]:
+            return ""
+        candidates = {
+            "boreholes": ("esri_globalid", "globalid"),
+            "observations": ("esri_globalid", "globalid"),
+            "sarv_localities": ("sarv_id",),
+            "sarv_sites": ("sarv_id",),
+            "sarv_drillcores": ("sarv_id",),
+            "veka_boreholes": ("eelis_id",),
+        }.get(role, ())
+        field = next(
+            (name for name in candidates if layer.fields().indexOf(name) >= 0),
+            "",
+        )
+        if not field:
+            return ""
+        values = sorted(active["values"].get(role, set()))
+        if not values:
+            return f'"{field}" IS NULL AND "{field}" IS NOT NULL'
+        literals = ", ".join(
+            value if value.lstrip("-").isdigit()
+            else f"'{value.replace(chr(39), chr(39) * 2)}'"
+            for value in values
+        )
+        return f'"{field}" IN ({literals})'
+
+    def _with_search_filter(self, layer, role, base_expression=""):
+        clauses = [
+            clause for clause in (
+                base_expression,
+                self._search_filter_clause(layer, role),
+            ) if clause
+        ]
+        return " AND ".join(f"({clause})" for clause in clauses)
 
     def run_search(self, criteria, callback):
         source = criteria.get("source", "both")
-        wants_egt = source in {"both", "egt"}
-        wants_sarv = source in {"both", "sarv"}
+        wants_egt = source in {"all", "both", "egt"}
+        wants_sarv = source in {"all", "both", "sarv"}
+        wants_veka = source in {"all", "veka"}
         related = criteria.get("related", {})
         stratigraphic_indices = criteria.get("stratigraphic_indices", set())
         if (
@@ -1963,12 +3188,17 @@ class QeoloogPlugin:
             roles.extend(("boreholes", "observations"))
         if wants_sarv:
             roles.extend(("sarv_localities", "sarv_sites", "sarv_drillcores"))
+        if wants_veka:
+            roles.append("veka_boreholes")
         selected_roles = criteria.get("kinds")
         if selected_roles is not None:
             roles = [role for role in roles if role in selected_roles]
         for role in roles:
             for layer in self._role_layers(role):
-                loaded_sources.add("SARV" if role.startswith("sarv_") else "EGT")
+                loaded_sources.add(
+                    "SARV" if role.startswith("sarv_")
+                    else "VEKA" if role == "veka_boreholes" else "EGT"
+                )
                 request = QgsFeatureRequest()
                 if criteria.get("current_extent"):
                     try:
@@ -1985,8 +3215,11 @@ class QeoloogPlugin:
                         for field in layer.fields()
                     }
                     is_sarv = role.startswith("sarv_")
+                    is_veka = role == "veka_boreholes"
                     object_id = (
                         attributes.get("sarv_id") if is_sarv else
+                        (attributes.get("kkr_kood") or attributes.get("eelis_id"))
+                        if is_veka else
                         attributes.get("esri_globalid") or attributes.get("globalid")
                     )
                     if is_sarv and "_sarv_allowed" in criteria:
@@ -1997,10 +3230,10 @@ class QeoloogPlugin:
                         )
                         if (target, str(target_id)) not in criteria["_sarv_allowed"]:
                             continue
-                    if not is_sarv and allowed_egt is not None:
+                    if not is_sarv and not is_veka and allowed_egt is not None:
                         if str(object_id).upper() not in allowed_egt:
                             continue
-                    if not is_sarv:
+                    if not is_sarv and not is_veka:
                         object_key = str(object_id).upper()
                         rejected = False
                         for key, requirement in related.items():
@@ -2017,6 +3250,7 @@ class QeoloogPlugin:
                             continue
                     depth = (
                         attributes.get("depth") if is_sarv else
+                        attributes.get("sygavus") if is_veka else
                         attributes.get("pikkus") or attributes.get("vertikaalne_ulatus")
                     )
                     try:
@@ -2031,11 +3265,16 @@ class QeoloogPlugin:
                         numeric_depth is None or numeric_depth > depth_max
                     ):
                         continue
-                    name = (
-                        attributes.get("name_en") if is_sarv and self.language == "en"
-                        else attributes.get("name") if is_sarv
-                        else attributes.get("nimi")
-                    ) or attributes.get("name") or attributes.get("alias") or attributes.get("number") or object_id
+                    if is_sarv:
+                        name = (
+                            attributes.get("name_en") if self.language == "en"
+                            else attributes.get("name")
+                        ) or attributes.get("name") or attributes.get("number")
+                    elif is_veka:
+                        name = attributes.get("nimi") or attributes.get("kkr_kood")
+                    else:
+                        name = attributes.get("nimi") or attributes.get("alias")
+                    name = name or attributes.get("number") or object_id
                     relevance = self._search_relevance(
                         text_query,
                         primary_values=(
@@ -2048,23 +3287,33 @@ class QeoloogPlugin:
                             attributes.get("ma_orig_id"),
                             attributes.get("land_board_id"),
                             attributes.get("kande_alus_nr"),
+                            attributes.get("kkr_kood"),
+                            attributes.get("katastri_nr"),
+                            attributes.get("pass_nr"),
+                            attributes.get("seire_nr"),
                         ),
                         other_values=(
                             attributes.get("name"),
                             attributes.get("name_en"),
                             attributes.get("type"),
+                            attributes.get("aadress"),
+                            attributes.get("maayksus"),
+                            attributes.get("maa_nimi"),
+                            attributes.get("otstarve"),
+                            attributes.get("pvk_nimi"),
                         ),
                     )
                     if relevance is None:
                         continue
                     rows.append({
-                        "source": "SARV" if is_sarv else "EGT",
+                        "source": "SARV" if is_sarv else "VEKA" if is_veka else "EGT",
                         "type": self.t({
                             "boreholes": "Puurauk",
                             "observations": "Vaatluspunkt",
                             "sarv_localities": "Lokaliteet",
                             "sarv_sites": "Uuringupunkt",
                             "sarv_drillcores": "Puursüdamik",
+                            "veka_boreholes": "VEKA puurkaev",
                         }.get(role, role)),
                         "name": name,
                         "id": object_id,
@@ -2072,6 +3321,11 @@ class QeoloogPlugin:
                         "_layer_id": layer.id(),
                         "_feature_id": int(feature.id()),
                         "_role": role,
+                        "_filter_id": (
+                            attributes.get("eelis_id") if is_veka
+                            else attributes.get("sarv_id") if is_sarv
+                            else object_id
+                        ),
                         "_search_score": relevance,
                     })
         rows.sort(key=lambda row: (
@@ -2080,12 +3334,15 @@ class QeoloogPlugin:
             str(row.get("name") or "").casefold(),
         ))
         total_count = len(rows)
-        rows = rows[:500]
+        if not criteria.get("_return_all"):
+            rows = rows[:500]
         missing = []
         if wants_egt and "EGT" not in loaded_sources:
             missing.append("EGT")
         if wants_sarv and "SARV" not in loaded_sources:
             missing.append("SARV")
+        if wants_veka and "VEKA" not in loaded_sources:
+            missing.append("VEKA")
         message = (
             f"{total_count} {self.t('tulemust')}"
             + (
@@ -2353,12 +3610,20 @@ class QeoloogPlugin:
             field.name(): feature.attribute(field.name())
             for field in layer.fields()
         }
+        attributes = self._detail_attributes_with_location(
+            attributes, layer, feature
+        )
         role = item.get("_role") or self._layer_role(layer)
         self._show_highlight(layer, feature)
         if role.startswith("sarv_"):
             self._load_sarv_point_details(
                 role, str(item.get("name") or item.get("id")),
                 attributes, layer, feature,
+            )
+        elif role == "veka_boreholes":
+            self._load_veka_details(
+                str(item.get("name") or item.get("id")), attributes,
+                layer, feature,
             )
         else:
             global_id = (
@@ -2416,7 +3681,7 @@ class QeoloogPlugin:
         click_geometry = QgsGeometry.fromPointXY(map_point)
         best = None
         roles = [
-            "boreholes", "observations", "sarv_drillcores",
+            "boreholes", "observations", "veka_boreholes", "sarv_drillcores",
             "sarv_sites", "sarv_localities",
         ]
         active_layer = self.iface.activeLayer()
@@ -2448,7 +3713,9 @@ class QeoloogPlugin:
                         }
                         if (
                             role in {"boreholes", "observations"}
-                            and not self._passes_related_filter(feature_attributes)
+                            and not self._passes_related_filter(
+                                feature_attributes, role
+                            )
                         ):
                             continue
                         geometry = QgsGeometry(feature.geometry())
@@ -2460,12 +3727,18 @@ class QeoloogPlugin:
                     continue
         if best is None or best[0] > tolerance:
             self.message(
-                "No visible EGT or SARV point was found here." if self.language == "en"
-                else "Selles kohas ei leitud nähtavat EGT ega SARV-i punkti."
+                "No visible EGT, SARV or VEKA point was found here." if self.language == "en"
+                else "Selles kohas ei leitud nähtavat EGT, SARV-i ega VEKA punkti."
             )
             return
         _, role, layer, feature = best
-        attributes = {field.name(): feature.attribute(field.name()) for field in layer.fields()}
+        attributes = {
+            field.name(): feature.attribute(field.name())
+            for field in layer.fields()
+        }
+        attributes = self._detail_attributes_with_location(
+            attributes, layer, feature
+        )
         if role in {
             "sarv_localities", "sarv_sites", "sarv_drillcores",
         }:
@@ -2475,6 +3748,11 @@ class QeoloogPlugin:
             ) or attributes.get("name") or attributes.get("number") or attributes.get("sarv_id")
             self._show_highlight(layer, feature)
             self._load_sarv_point_details(role, str(name), attributes, layer, feature)
+            return
+        if role == "veka_boreholes":
+            name = attributes.get("nimi") or attributes.get("kkr_kood") or "VEKA"
+            self._show_highlight(layer, feature)
+            self._load_veka_details(str(name), attributes, layer, feature)
             return
 
         try:
@@ -2497,20 +3775,33 @@ class QeoloogPlugin:
         self._show_highlight(layer, feature)
         self._load_details(role, str(global_id), str(name), attributes)
 
-    def _passes_related_filter(self, attributes):
-        if not self.dock or len(self.related_index) < 4:
-            return True
+    def _passes_related_filter(self, attributes, role="boreholes"):
+        """Match EGT filters that are intentionally evaluated client-side."""
         object_id = str(
             attributes.get("esri_globalid") or attributes.get("globalid") or ""
         ).upper()
-        for key, requirement in self.dock.filters.related_requirements().items():
-            if requirement == "any":
-                continue
-            present = object_id in self.related_index.get(key, set())
-            if requirement == "yes" and not present:
+        active_search = self._search_filter
+        if active_search and role in active_search["roles"]:
+            allowed = {
+                str(value).upper()
+                for value in active_search["values"].get(role, set())
+            }
+            if object_id not in allowed:
                 return False
-            if requirement == "no" and present:
-                return False
+        if (
+            self._egt_stratigraphic_filter_key is not None
+            and object_id not in (self._egt_stratigraphic_filter_allowed or set())
+        ):
+            return False
+        if self.dock and len(self.related_index) >= 4:
+            for key, requirement in self.dock.filters.related_requirements().items():
+                if requirement == "any":
+                    continue
+                present = object_id in self.related_index.get(key, set())
+                if requirement == "yes" and not present:
+                    return False
+                if requirement == "no" and present:
+                    return False
         return True
 
     def _show_highlight(self, layer, feature):
@@ -2532,7 +3823,293 @@ class QeoloogPlugin:
             self.selection_highlight.hide()
             self.selection_highlight = None
 
+    def _load_veka_details(self, name, attributes, layer, feature):
+        """Show VEKA overview and load only this well's related datasets."""
+        attributes = self._detail_attributes_with_location(
+            attributes, layer, feature
+        )
+        self._detail_token += 1
+        token = self._detail_token
+        details = self.dock.details
+        self.dock.show_details()
+        details.show_loading(name, attributes, "veka_boreholes")
+        details.set_ready(name)
+        identifier = attributes.get("eelis_id")
+        if identifier in (None, ""):
+            return
+        source_row = self._veka_rows.get(str(identifier), {})
+
+        def current(callback):
+            return lambda rows: (
+                callback(rows) if token == self._detail_token else None
+            )
+
+        def failed(label, clear_callback=None):
+            def handler(error):
+                if token == self._detail_token:
+                    if clear_callback:
+                        clear_callback([])
+                    self.warning(
+                        f"Could not load VEKA {label}: {error}"
+                        if self.language == "en" else
+                        f"VEKA andmete {label} laadimine ebaõnnestus: {error}"
+                    )
+            return handler
+
+        def profile_loaded(rows):
+            if token != self._detail_token:
+                return
+            units = [{
+                "z_suht_ylemine": row.get("lasum"),
+                "z_suht_alumine": row.get("lamam"),
+                "indeks": row.get("geol_vanus"),
+                "litoloogia": row.get("kivim_nimetus"),
+                "litoloogia_orig": row.get("kivim_nimetus"),
+            } for row in rows]
+            details.set_profile(units)
+
+        self.network.query_eelis_pages(
+            "f_puuraugud_labiloige",
+            {"labil_puurauk_id": f"eq.{identifier}", "order": "jrk_nr.asc"},
+            (
+                "labiloige_id", "jrk_nr", "geol_vanus",
+                "kivim_nimetus", "lasum", "lamam", "paksus",
+            ),
+            profile_loaded, failed("log", details.set_profile), limit=2000,
+        )
+        self.network.query_eelis_pages(
+            "f_puuraugud_konstruktsioon",
+            {
+                "konstr_puurauk_id": f"eq.{identifier}",
+                "order": "alg.asc",
+            },
+            (
+                "konstr_id", "konstr_tyyp", "konstr_tyyp_selg",
+                "konstr_staatus_selg", "diam", "alg", "lopp",
+                "tx_manteltoru_isolats", "tx_kirjeldus",
+                "tx_ehitustooted",
+            ),
+            current(details.set_veka_construction),
+            failed("construction", details.set_veka_construction), limit=2000,
+        )
+        self.network.query_eelis_pages(
+            "f_puuraugud_puurauk_param",
+            {
+                "param_puurauk_id": f"eq.{identifier}",
+                "order": "katse_kp.desc",
+            },
+            (
+                "puurauk_param_id", "puurauk_param_tyyp",
+                "puurauk_param_tyyp_selg", "veekompleks",
+                "veekompleks_selg", "sygavus", "st_veetase",
+                "dyn_veetase", "alandus", "deebit", "kestus",
+                "tx_tehnoloogia", "katse_kp",
+            ),
+            current(details.set_veka_pumping_tests),
+            failed("pumping tests", details.set_veka_pumping_tests), limit=2000,
+        )
+        self.network.query_eelis_pages(
+            "f_puuraugud",
+            {"id": f"eq.{identifier}"},
+            (
+                "puurija_nimi", "puurija_kood", "puur_org",
+                "puur_viis_selg", "puur_mark",
+            ),
+            current(
+                lambda rows: details.set_veka_overview_fields(
+                    rows[0] if rows else {}
+                )
+            ),
+            failed("driller information"), limit=1,
+        )
+        cadastral_number = veka_cadastral_number(
+            attributes.get("katastri_nr"),
+            source_row.get("katastri_nr"),
+            attributes.get("kkr_kood"),
+            source_row.get("kkr_kood"),
+        )
+        registry_code = str(
+            attributes.get("kkr_kood")
+            or source_row.get("kkr_kood")
+            or (
+                f"PRK{int(cadastral_number):07d}"
+                if cadastral_number else ""
+            )
+        ).strip()
+
+        chemistry = {"primary": None, "legacy": None}
+        protocol_started = {"value": False}
+
+        def show_chemistry():
+            if (
+                token != self._detail_token
+                or chemistry["primary"] is None
+                or chemistry["legacy"] is None
+            ):
+                return
+            rows = merge_water_analyses(
+                chemistry["primary"], chemistry["legacy"]
+            )
+            details.set_veka_chemistry(rows)
+            if not protocol_started["value"]:
+                protocol_started["value"] = True
+                resolve_protocols(rows)
+
+        def chemistry_failed(source, label):
+            def handler(error):
+                if token != self._detail_token:
+                    return
+                chemistry[source] = []
+                show_chemistry()
+                self.warning(
+                    f"Could not load VEKA {label}: {error}"
+                    if self.language == "en" else
+                    f"VEKA andmete {label} laadimine ebaõnnestus: {error}"
+                )
+            return handler
+
+        def primary_loaded(rows):
+            if token != self._detail_token:
+                return
+            for row in rows:
+                permit = row.get("loa_nr")
+                if permit:
+                    row["_protocol_url"] = kotkas_registry_url(permit)
+                    row["_protocol_label"] = "KOTKAS"
+                row["_source"] = "KOTKAS"
+            chemistry["primary"] = rows
+            show_chemistry()
+
+        def legacy_loaded(payload, source_url):
+            if token != self._detail_token:
+                return
+            chemistry["legacy"] = parse_veka_water_analyses(
+                payload, source_url
+            )
+            show_chemistry()
+
+        def resolve_protocols(rows):
+            """Resolve KOTKAS report periods and direct protocol files."""
+            by_permit = {}
+            for row in rows:
+                permit = str(row.get("loa_nr") or "").strip()
+                if permit:
+                    by_permit.setdefault(permit, []).append(row)
+            if not by_permit:
+                return
+            pending = {"count": len(by_permit)}
+            reports = {}
+
+            def registries_finished():
+                pending["count"] -= 1
+                if pending["count"] or token != self._detail_token:
+                    return
+                if not reports:
+                    details.set_veka_chemistry(rows)
+                    return
+                report_pending = {"count": len(reports)}
+
+                def report_finished():
+                    report_pending["count"] -= 1
+                    if (
+                        not report_pending["count"]
+                        and token == self._detail_token
+                    ):
+                        details.set_veka_chemistry(rows)
+
+                for report_url, report_rows in reports.items():
+                    def report_loaded(
+                        payload, report_rows=report_rows,
+                        report_url=report_url,
+                    ):
+                        if token == self._detail_token:
+                            protocols = parse_kotkas_protocols(payload)
+                            for row in report_rows:
+                                files = protocols.get(
+                                    normalized_analysis_number(
+                                        row.get("analyys_number")
+                                    ),
+                                    [],
+                                )
+                                if files:
+                                    row["_protocol_url"] = files[0]["url"]
+                                    row["_protocol_label"] = (
+                                        files[0].get("label") or
+                                        self.t("Protokoll")
+                                    )
+                                else:
+                                    row["_protocol_url"] = report_url
+                                    row["_protocol_label"] = "KOTKAS"
+                        report_finished()
+
+                    self.network.get_text(
+                        report_url,
+                        report_loaded,
+                        lambda _error: report_finished(),
+                    )
+
+            for permit, permit_rows in by_permit.items():
+                def registry_loaded(payload, permit_rows=permit_rows):
+                    if token == self._detail_token:
+                        period_urls = parse_kotkas_report_registry(payload)
+                        for row in permit_rows:
+                            period = (
+                                str(
+                                    row.get("aruandlusperiood_algus_as")
+                                    or ""
+                                )[:10],
+                                str(
+                                    row.get("aruandlusperiood_lopp_as")
+                                    or ""
+                                )[:10],
+                            )
+                            report_url = period_urls.get(period)
+                            if report_url:
+                                reports.setdefault(report_url, []).append(row)
+                    registries_finished()
+
+                self.network.get_text(
+                    kotkas_registry_url(permit),
+                    registry_loaded,
+                    lambda _error: registries_finished(),
+                )
+
+        if cadastral_number:
+            self.network.query_eelis_pages(
+                "f_veenaitajad_W10_W1_public",
+                {"katastri_number": f"eq.{cadastral_number}"},
+                (
+                    "loa_nr", "aruandlusperiood_algus_as",
+                    "aruandlusperiood_lopp_as", "analyys_number",
+                    "proov_algus",
+                    "naitaja_kood", "naitaja_nimi", "naitaja_tulem",
+                    "naitaja_yhik", "proov_liik",
+                ),
+                primary_loaded,
+                chemistry_failed("primary", "water chemistry"),
+                limit=5000,
+            )
+        else:
+            chemistry["primary"] = []
+
+        if registry_code:
+            veka_url = (
+                "https://veka.eelis.ee/puurauk/"
+                f"{quote(registry_code, safe='')}"
+            )
+            self.network.get_text(
+                veka_url,
+                lambda payload: legacy_loaded(payload, veka_url),
+                chemistry_failed("legacy", "legacy water chemistry"),
+            )
+        else:
+            chemistry["legacy"] = []
+        show_chemistry()
+
     def _load_sarv_point_details(self, role, name, attributes, layer, feature):
+        attributes = self._detail_attributes_with_location(
+            attributes, layer, feature
+        )
         self._detail_token += 1
         token = self._detail_token
         self._detail_warning_token = None
@@ -2568,6 +4145,12 @@ class QeoloogPlugin:
                 for key, value in entity.items()
                 if not isinstance(value, list)
             }
+            for key in (
+                "_qeoloog_x_3301", "_qeoloog_y_3301",
+                "_qeoloog_longitude", "_qeoloog_latitude",
+            ):
+                if attributes.get(key) not in (None, ""):
+                    overview[key] = attributes[key]
             overview["sarv_id"] = entity.get("id")
             overview["source_type"] = {
                 "sarv_localities": "locality",
@@ -3001,6 +4584,7 @@ class QeoloogPlugin:
         )
 
     def _load_details(self, role, global_id, name, attributes):
+        attributes = self._detail_attributes_with_location(attributes)
         self._detail_token += 1
         token = self._detail_token
         self._detail_warning_token = None

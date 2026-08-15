@@ -1,7 +1,7 @@
-# Qeoloog 3.13.0
+# Qeoloog 3.21.2
 
-Qeoloog on QGIS 4 rakendus eelkõige EGT GEA ja SARV andmebaaside
-geoloogiaandmete kuvamiseks, seostamiseks ning uurimiseks. Lisaks saab avada ja
+Qeoloog on QGIS 4 rakendus EGT GEA ja SARV geoloogiaandmete ning EELIS/VEKA
+puurkaevuandmete kuvamiseks, seostamiseks ja uurimiseks. Lisaks saab avada ja
 seadistada Maa- ja Ruumiameti (MaRu) ning teiste avalike andmeallikate WMS/WFS
 teenuseid.
 
@@ -9,7 +9,8 @@ teenuseid.
 
 Qeoloog is a QGIS 4 application focused on viewing, linking and exploring
 geological data from the Geological Survey of Estonia (EGT) GEA database and
-the SARV geoscience data platform. It provides an interactive view of
+the SARV geoscience data platform, as well as EELIS/VEKA water-well data. It
+provides an interactive view of
 boreholes and observation points, including geological logs, drill-core boxes
 and images, samples, analyses, specimens, attachments and literature.
 
@@ -28,6 +29,134 @@ EGT and SARV sample, analysis and specimen-type filters. EGT map filters also
 include the complete official stratigraphic-index list and a partial
 **Contains** query across ordinary and compound indices.
 
+The compact **Cross-sections** tab opens or hides a separate resizable
+cross-section window. It combines selected EGT boreholes and observation
+points, SARV drill cores and VEKA water wells on shared absolute-elevation and
+distance axes without forcing the main Qeoloog dock to become wider. A section
+can follow a line drawn on the map, the object order, or equal spacing.
+Geological units, drill-core boxes, samples, analyses, specimens, VEKA
+construction and static water levels can be switched independently. A loaded
+local DEM raster can be sampled along the section line and compared visually
+with recorded wellhead elevations. The result is stored in the QGIS project
+and can be exported to SVG or PDF with an optional overview map.
+
+The **Export** tab selects an area by drawing a polygon on the map or opening
+a polygon vector file. Loaded EGT, SARV and VEKA points inside the area can be
+written as Leapfrog-compatible `collar.csv`, `survey.csv` and `interval.csv`
+tables. VEKA exports can optionally include static water level, specific
+capacity and one or more selected normalized water-analysis results.
+
+The drill-core **Editing mode** stores local EGT and SARV box corrections on
+the user's computer without modifying either upstream database. Corrected
+depths and other box fields are used in tables and cross-sections, and all
+saved corrections can be exported as JSON or CSV from the **Export** tab.
+
+## Koondläbilõiked
+
+EGT puuraugu või vaatluspunkti, SARV puursüdamiku ja VEKA puurkaevu saab lisada
+objektivaate päise linnukesega **Lisa läbilõikele**. Qeoloogi põhidoki
+**Läbilõiked** paan on kompaktne: **Ava läbilõikeaken** avab kogu tööala eraldi
+muudetava suurusega aknas ja sama nupp peidab selle taas. Akna sulgemisrist ei
+kustuta läbilõiget. Eraldi aknas saab:
+
+- paigutada objektid kaardile joonistatud läbilõikejoone, kasutaja määratud
+  järjekorra või võrdsete vahede järgi;
+- muuta objektide järjekorda, pöörata läbilõige ümber, objekt eemaldada või
+  puuduva/ebatäpse absoluutkõrguse käsitsi määrata;
+- kuvada tulbad ühisel absoluutkõrguse skaalal ning tegeliku piketi ja
+  läbilõikejoonest kõrvalekaldega;
+- lülitada eraldi indekseid, litoloogiat, piire, puursüdamikukaste, proove,
+  analüüse, eksemplare, VEKA konstruktsiooni, staatilist veetaset ja suudmeid;
+- hoida läbilõikejoont kaardil nähtavana;
+- eksportida SVG- või A3 PDF-faili, soovi korral koos QGIS-i kaardi
+  ülevaateaknaga.
+
+Läbilõike olek salvestub QGIS-i projekti. Horisontaalset ja vertikaalset
+mõõtkava saab muuta paanil olevatest väljadest; joonise kohal muudab
+`Ctrl`/`Command` + kerimisratas vertikaalset ning `Alt` + kerimisratas
+horisontaalset mõõtkava.
+
+### DEM-i võrdlus
+
+**DEM** rühmas kuvatakse projektis avatud failipõhised rasterkihid (WMS
+aluskaarte DEM-ina ei pakuta). Pärast rasterkihi ja kõrguskanali valimist loeb
+**Loe DEM-profiil** maapinnakõrguse piki läbilõikejoont. Salvestatud
+absoluutkõrgust ei kirjutata DEM-i väärtusega üle:
+
+- roheline joon näitab DEM-i maapinda ja pruun joon andmetes olevaid suudmeid;
+- iga objekti juures kuvatakse `ΔDEM` ning kahe kõrguse vahe mõõtejoon;
+- alla 1 m erinevus on roheline, 1–3 m erinevus merevaigukollane ja vähemalt
+  3 m erinevus punane;
+- kaardijoonest eemal oleva objekti puhul kuvatakse ka kõrvalekalle, sest
+  `ΔDEM` võrreldakse objekti projektsiooniga läbilõikejoonel.
+
+Nii jääb lähteandme kõrgus auditeeritavaks, kuid võimalik vale
+absoluutkõrgus on joonisel kohe nähtav.
+
+## Kohalikud andmeparandused
+
+Objektivaate **Puursüdamik** paanis saab aktiveerida
+**Redigeerimisrežiimi**, valida EGT või SARV puursüdamiku kasti ja muuta:
+
+- kasti numbrit;
+- ülemist ja alumist sügavust;
+- diameetrit;
+- staatust või hoiukoha kirjeldust.
+
+Muudatused salvestuvad QGIS-i kasutajaprofiili ainult kohalikus arvutis.
+EGT ega SARV algandmebaasi ei kirjutata. Parandatud väärtusi kasutatakse
+puursüdamiku tabelis ja läbilõikejoonistel; veerg **Muudetud** näitab kohaliku
+paranduse aega. Nupuga **Taasta algandmed** saab valitud kasti paranduse
+eemaldada.
+
+**Ekspordi** paani rühmas **Kohalikud andmeparandused** saab kõik salvestatud
+puursüdamiku kastide parandused eksportida:
+
+- JSON-failina koos algväärtuste, parandatud väljade, lähte-ID-de ja
+  ajatemplitega;
+- CSV-failina, kus iga muudetud väli on eraldi auditireana.
+
+## Leapfrog-eksport
+
+**Ekspordi** paanis saab valida ala kahel viisil:
+
+- joonistada QGIS-i kaardile vabakujuline polygon;
+- avada polygonkiht GeoPackage-, Shapefile-, GeoJSON- või KML-failist.
+
+Ekspordiks tuleb vastavad PA/VP, SK ja/või VK kihid esmalt projekti laadida.
+Valida saab EGT, SARV ja VEKA eraldi või mistahes kombinatsioonis. Kihile
+rakendatud aktiivne QGIS-i filter jääb ekspordil kehtima. Väljundi
+koordinaatsüsteem on seadistatav; vaikimisi kasutatakse `EPSG:3301`.
+
+Valitud kausta luuakse:
+
+- `collar.csv` – Hole ID, X/Y/Z, kogusügavus, allikas, lähte-ID ja nimi;
+- `survey.csv` – Hole ID, mõõtesügavus, asimuut ja kalle;
+- `interval.csv` – From/To, litoloogia, stratigraafia, allikas ja
+  intervallitüüp;
+- `export_report.txt` – CRS, ridade arv, puuduva absoluutkõrgusega objektid
+  ning päringute hoiatused.
+
+EGT Interval-ridades eksporditakse nii litoloogia kui indeks. Kui indeks on
+`Liitüksus`, kirjutatakse väärtus kujul `alumine-ülemine`, näiteks
+`O3mo-O3adl`. VEKA Interval-ridades kasutatakse puurkaevu geoloogilist
+läbilõiget. SARV puursüdamike kastid eksporditakse `DrillcoreBox`
+intervallidena koos olemasoleva stratigraafia ja kastikirjeldusega.
+
+VEKA puhul saab Collar-tabelisse lisada:
+
+- uusima olemasoleva staatilise veetaseme sügavuse ja absoluutkõrguse;
+- uusima arvutatava eritootlikkuse ühikus l/(s·m);
+- ühe või mitu veeanalüüsi näitajat. Ühildatavad lähteühikud teisendatakse
+  Qeoloogi ühtlustatud ühikusse ning mitme tulemuse korral saab kasutada
+  uusimat, suurimat, väikseimat või keskmist väärtust.
+
+Kui kalde või asimuudi info puudub, lisatakse Survey-tabelisse vertikaalselt
+alla suunatud trajektoor `Dip = +90°`, `Azimuth = 0°`. See vastab Leapfrogi
+vaikeseadele, kus negatiivne kalle näitab üles. Puuduvat absoluutkõrgust ei
+asendata nulli ega oletatava väärtusega; objekt jääb Collar-tabelisse tühja
+Elevation-väljaga ja märgitakse ekspordiaruandes.
+
 ## Tööriistariba
 
 Vaikimisi on ribal seitse otsenuppu:
@@ -42,7 +171,8 @@ Vaikimisi on ribal seitse otsenuppu:
 | SK | SARV lokaliteedid, uuringupunktid ja puursüdamikud | SARV API |
 | AP | EGT 1:50 000 aluspõhja avamused | WMS |
 
-**LK** avab lisakihtide menüü. Seal on aluskaardid, geoloogia, uuringute ja
+**LK** avab lisakihtide menüü. Seal on muu hulgas **VK** ehk EELIS/VEKA
+puurkaevud ning aluskaardid, geoloogia, uuringute ja
 maavarade kihid ning abikihid, muu hulgas kitsenduste vööndid. Menüü linnuke
 lisab või eemaldab kihi.
 Kui LK-menüüst lisatud kiht on projektis aktiivne, ilmub selle nupp ajutiselt
@@ -57,7 +187,7 @@ Hammasratta alt saab:
 - valida EGT läbilõike detailandmete esmaseks allikaks WFS-i või GEA API;
 - näidata või peita LK rippmenüüde rühmi;
 - paigutada iga kihi põhiribale, tema kindlasse kodurippmenüüsse või keelata;
-- lisada ja eemaldada WMS/WFS kihte ning SARV punktikataloogi;
+- lisada ja eemaldada WMS/WFS kihte ning SARV ja VEKA punktikatalooge;
 - lugeda GetCapabilities-kihiloendi;
 - muuta tähist, värvi, nime, URL-i, kihinime ja WMS-stiili;
 - lülitada sisse režiimi, kus otsenupu korduv vajutus eemaldab kihi;
@@ -66,6 +196,120 @@ Hammasratta alt saab:
 
 Kihi kodurühm on pärast loomist lukus: näiteks katastriüksuseid ei saa tõsta
 geoloogia rühma. Seadistus säilib QGIS-i kasutajaprofiilis.
+
+## VEKA puurkaevud
+
+**VK** laadib EELIS-e avalikust API-st VEKA puurkaevud lokaalsesse QGIS-i
+punktikihti. Põhiandmed laaditakse ühe korra ning mahukamad seotud tabelid
+alles siis, kui vastavat filtrit või kujundust kasutatakse. Veeanalüüside puhul
+laaditakse eraldi näitajate kataloog ja seejärel ainult valitud näitaja
+tulemused. Sama näitaja teisendatavad ühikud ühendatakse: massikontsentratsioon
+teisendatakse ühikusse mg/l, elektrijuhtivus ühikusse µS/cm ning
+mikrobioloogilised arvud ühikusse arv/100 ml. Näiteks Baariumi mg/l ja µg/l
+tulemused on üks otsitav näitaja. Teadaolevad sama näitaja alternatiivsed
+koodid ühendatakse samuti; ebaselge semantikaga koodid jäävad eraldi ning
+nende kood kuvatakse valikus.
+
+Deebiti väljad piiravad katsepumpamisel mõõdetud vooluhulka ühikus l/s.
+Eritootlikkus arvutatakse sama katse deebiti ja veetaseme alanduse suhtena
+ühikus l/(s·m). Valik **Mitme pumpamiskatse käsitlus** määrab, kas piisab ühest
+sobivast katsest või kasutatakse uusimat, suurimat, väikseimat või keskmist
+tulemust.
+
+VEKA paanis saab puurkaeve filtreerida:
+
+- nime, aadressi, registrikoodi, katastri-, passi- või seirenumbri järgi;
+- otstarbe ja põhjaveekogumi mitmikvalikuga;
+- puurimise aasta ja filtri sügavusintervalli järgi;
+- pumpamiskatse deebiti ja arvutatud eritootlikkuse järgi;
+- valitud veeproovi näitaja tulemuse ning proovivõtu aasta järgi.
+
+Mitme pumpamiskatse või veeproovi korral saab kasutada vähemalt ühte vastet,
+uusimat, suurimat, väikseimat või keskmist tulemust. Eritootlikkus arvutatakse
+deebiti ja alanduse suhtena; puuduva või nullise alandusega katset ei kasutata.
+VEKA aktiivsed filtrid rakenduvad ka ühisele otsingule. Kaardipunktilt saab
+avada puurkaevu üldandmed, VEKA veebivaate ja olemasolu korral geoloogilise
+läbilõike. Üldandmetesse lisatakse EELIS-est puurija nimi, registrikood,
+puurimisviis, puurmasin või pärandandmetes säilinud ettevõtte kood, kui
+vastav väärtus on olemas. VEKA objektil on EGT/SARV proovide, analüüside, eksemplaride,
+manuste ja kirjanduse asemel eraldi **Konstruktsiooni**, **Pumpamiskatsete**
+ning **Veekeemia** paanid. Konstruktsioonis eristatakse puuri diameetrit,
+manteltoru, filtrit ja avatud või filtrita osa koos sügavusvahemike ning
+diameetriga. Pumpamiskatsetes kuvatakse muu hulgas veetasemed, alandus,
+deebit ja arvutatud eritootlikkus. Veekeemias ühendatakse uuema KOTKAS API
+kirjed VEKA veebivaates säilinud pärandanalüüsidega, säilitatakse lähteühik
+ning kuvatakse selle kõrval ka ühtlustatud tulemus. KOTKAS kirjel avab
+**Protokoll** võimaluse korral originaalfaili ja muul juhul avaliku aruande;
+pärandkirjel avab link VEKA lähtevaate.
+
+Konstruktsioon kuvatakse ka VEKA läbilõikel eraldi sisselülitatava rajana.
+Helehall täide tähistab puuri diameetrit, tume topeltjoon manteltoru, sinine
+viirutus filtrit ning oranž katkendjoon avatud või filtrita osa. Raja laius
+skaleerub konstruktsiooniosa diameetri järgi ja `Ø` märgis näitab diameetrit
+millimeetrites. Uusim kuupäevaga staatilise veetaseme mõõtmine kuvatakse
+eraldi sisse-välja lülitatava sinise joone, sügavuse ja mõõtmiskuupäevaga.
+Veekeemia sidumisel normaliseeritakse katastrinumber ning
+puuduva katastrinumbri korral tuletatakse võti võimalusel `PRK` registrikoodist.
+
+VEKA sümboloogia disainer võimaldab määrata punkti värvi, suuruse või mõlemad
+puurimise aasta, puuraugu või filtri sügavuse, deebiti, eritootlikkuse või
+valitud veeproovi näitaja järgi. Kasutada saab kvantiile või võrdseid
+vahemikke, 1–12 klassi, eri värviskaalasid ja seadistatavat markerisuurust.
+Puuduvate väärtuste kuvamise saab halli klassina sisse või välja lülitada.
+Valitud kujundus säilib QGIS-i kasutajaprofiilis.
+
+### VEKA in English
+
+The **VK** layer loads EELIS/VEKA water wells into a local QGIS point layer.
+The VEKA tab filters wells by text, purpose, groundwater body, drilling year,
+filter-depth interval, pumping-test discharge, calculated specific capacity,
+and a selected water-quality result and sampling year. Related tables are
+loaded only when needed; water-quality metadata and the selected parameter's
+results are requested separately. Convertible results for one parameter are
+normalized to a common unit: mass concentration to mg/l, conductivity to
+µS/cm, and microbiological counts to counts/100 ml. Known aliases such as the
+alternative coliform and enterococci codes are combined, while ambiguous
+codes remain separate and visible in the selector. The filtered wells are
+also used by the shared Search tab. Discharge is entered in l/s; specific
+capacity is calculated as discharge divided by drawdown in l/(s·m). The
+multiple-test selector controls whether any, latest, maximum, minimum, or
+mean pumping-test result is used.
+
+Opening a VEKA map point uses a dedicated detail view. Instead of unrelated
+EGT/SARV samples and analyses, it presents separate **Construction**,
+**Pumping tests**, and **Water chemistry** tabs. The construction table
+distinguishes bore diameter, casing, screen and open or unscreened intervals.
+Pumping tests include water levels, drawdown, discharge and calculated
+specific capacity; water chemistry retains the source value and unit next to
+the normalized result. The water-chemistry table combines current KOTKAS API
+records with analyses retained only in the legacy VEKA well page. Its protocol
+link opens the original KOTKAS file where one is publicly available, otherwise
+the public report or VEKA source page. Available driller, drilling method and
+rig information is included in the overview. The newest dated static water
+level is drawn on the VEKA profile as an optional blue line with its depth and
+measurement date.
+
+The shared Search tab can apply all matching EGT, SARV and VEKA objects as a
+temporary map-layer filter without replacing the filters configured on the
+source-specific tabs. Reset clears the search criteria, result table and this
+temporary filter.
+
+The VEKA geological log also contains a separately switchable construction
+track. Light grey represents bore diameter, double dark lines represent
+casing, blue hatching represents a screen, and an orange dashed outline
+represents an open or unscreened section. Track width is scaled by diameter
+and the `Ø` label gives millimetres. Water-chemistry lookup normalizes the
+cadastral number and can fall back to the `PRK` registry code.
+
+The symbology designer maps colour, marker size, or both to drilling year,
+well or filter depth, discharge, specific capacity, or the selected
+water-quality parameter. It supports quantile and equal-interval classes,
+configurable ramps and sizes, and an optional grey class for missing values.
+The selected style is retained in the QGIS user profile.
+
+Related-data tables for drill-core boxes, samples, analyses, specimens,
+attachments and literature, as well as the VEKA-specific tables, can be
+sorted in either direction by clicking a column header.
 
 ## EGT objektivaade
 
@@ -136,6 +380,9 @@ proovide ja analüüside olemasolu. Tulemust saab nupust kaardil avada ja
 objektivaatesse laadida ilma kaardi mõõtkava muutmata. Täpsed numbri- ja
 ID-vasted ning nimevasted kuvatakse enne osalisi vasteid. Kuvatakse kuni 500
 esimest vastet ning allikad ei liideta ilma kinnitatud vasteta üheks kirjeks.
+**Rakenda filtrina** piirab otsingusse kaasatud kaardikihid leitud objektidega,
+säilitades samal ajal EGT, SARV ja VEKA paanide muud aktiivsed filtrid.
+**Lähtesta** puhastab otsingutingimused, tulemused ja otsingufiltri.
 
 GEA `sarv_id` käsitletakse SARV puursüdamiku võõrvõtmena ega võrrelda sama
 numbriga lokaliteedi või uuringupunkti ID-ga. Muudel juhtudel kinnitatakse EGT
@@ -200,8 +447,8 @@ ulatuse tõttu Saaremaa lääneosa säilitav ulatuse parandus.
 4. Luba plugin; QGIS-i ilmuvad tööriistariba ja menüü **Qeoloog**.
 
 Plugin eeldab QGIS 4.x versiooni ja internetiühendust. Andmeallikad on Maa- ja
-Ruumiamet, Eesti Geoloogiateenistus ning teised plugina kataloogis nimetatud
-avalike teenuste valdajad.
+Ruumiamet, Eesti Geoloogiateenistus, SARV ning EELIS/VEKA avalik API ja teised
+plugina kataloogis nimetatud avalike teenuste valdajad.
 
 ## License
 

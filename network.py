@@ -14,7 +14,9 @@ AUQ_REST = "https://gis.egt.ee/arcgis/rest/services/AUQ_public/AUQ_webapp_open/M
 EGT_WFS = "https://maps.egt.ee/geoserver/faktika/ows"
 GEA_API = "https://gea-api.egt.ee"
 SARV_API = "https://rwapi.geoloogia.info/api/v1/public"
+EELIS_API = "https://keskkonnaandmed.envir.ee"
 MAX_CAPABILITIES_BYTES = 20 * 1024 * 1024
+MAX_HTML_BYTES = 8 * 1024 * 1024
 
 
 def parse_capabilities(payload, protocol):
@@ -105,6 +107,16 @@ class NetworkClient:
     def get_json(self, url, success, failure):
         target = url if isinstance(url, QUrl) else QUrl(url)
         self._get(target, lambda data: success(json.loads(bytes(data).decode("utf-8"))), failure)
+
+    def get_text(self, url, success, failure, max_bytes=MAX_HTML_BYTES):
+        """Load a bounded public HTML/text response as UTF-8."""
+        target = url if isinstance(url, QUrl) else QUrl(url)
+        self._get(
+            target,
+            lambda data: success(bytes(data).decode("utf-8", errors="replace")),
+            failure,
+            max_bytes=max_bytes,
+        )
 
     def query_auq(self, table_id, where, success, failure, order_by=""):
         url = QUrl(f"{AUQ_REST}/{table_id}/query")
@@ -271,6 +283,39 @@ class NetworkClient:
 
         load_page(url)
 
+    def query_eelis_pages(
+        self, resource, parameters, fields, success, failure, limit=20000,
+    ):
+        """Load all pages from an EELIS PostgREST public-API resource."""
+        rows = []
+        path = str(resource).strip("/")
+
+        def load_page(offset):
+            url = QUrl(f"{EELIS_API}/{path}")
+            query = QUrlQuery()
+            if fields:
+                query.addQueryItem("select", ",".join(fields))
+            for key, value in (parameters or {}).items():
+                if value not in (None, "", []):
+                    query.addQueryItem(str(key), str(value))
+            query.addQueryItem("limit", str(limit))
+            query.addQueryItem("offset", str(offset))
+            url.setQuery(query)
+
+            def decoded(payload):
+                if not isinstance(payload, list):
+                    failure("Invalid EELIS API response")
+                    return
+                rows.extend(payload)
+                if len(payload) >= limit:
+                    load_page(offset + len(payload))
+                else:
+                    success(rows)
+
+            self.get_json(url, decoded, failure)
+
+        load_page(0)
+
     def query_geological_units(self, role, global_id, success, failure):
         """Load the selected object's depth intervals from EGT WFS as GeoJSON."""
         type_name = (
@@ -341,7 +386,7 @@ class NetworkClient:
         self.get_json(url, decoded, failure)
 
     def query_stratigraphic_parent_ids(
-        self, indices, success, failure, page_size=2000, contains="",
+        self, indices, success, failure, page_size=1000, contains="",
     ):
         """Return EGT UUIDs matching selected and/or partial unit indices."""
         selected = sorted({
@@ -425,8 +470,22 @@ class NetworkClient:
                     )
                     if value not in (None, ""):
                         parent_ids.add(str(value).upper())
-                if len(features) >= page_size:
-                    load_task(task_index, start_index + len(features))
+                next_index = start_index + len(features)
+                try:
+                    number_matched = int(payload.get("numberMatched"))
+                except (TypeError, ValueError):
+                    number_matched = None
+                # GeoServer currently caps this endpoint at 1000 rows even
+                # when a larger WFS ``count`` is requested.  Honour the
+                # response total when available and retain page-size fallback
+                # semantics for servers which omit ``numberMatched``.
+                has_more = (
+                    next_index < number_matched
+                    if number_matched is not None
+                    else len(features) >= page_size
+                )
+                if features and has_more:
+                    load_task(task_index, next_index)
                 else:
                     load_task(task_index + 1)
 
@@ -449,7 +508,7 @@ class NetworkClient:
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.13.0",
+            "QGIS Qeoloog/3.18.1",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)
@@ -470,9 +529,7 @@ class NetworkClient:
             self._replies.discard(reply)
             try:
                 if limit_exceeded["value"]:
-                    failure(
-                        "Capabilities response exceeds the 20 MB safety limit."
-                    )
+                    failure("Response exceeds the configured safety limit.")
                 elif reply.error() != QNetworkReply.NetworkError.NoError:
                     failure(reply.errorString())
                 else:

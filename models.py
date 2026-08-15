@@ -116,6 +116,12 @@ DEFAULT_LAYERS = (
         color="#356f92", role="sarv_points", home_group="geology", placement="toolbar",
     ),
     _layer(
+        "VK", "VEKA - puurkaevud", "VEKA - water wells", "VEKA",
+        "https://keskkonnaandmed.envir.ee", "f_puuraugud",
+        color="#2876a8", role="veka_boreholes", home_group="geology",
+        placement="dropdown",
+    ),
+    _layer(
         "AP", "EGT - 1:50 000 aluspõhja avamused", "EGS - 1:50,000 bedrock outcrops",
         "WMS", K50, "ap_avamus_a_50t", style="ap_avamused_k50",
         color="#8a3e58", home_group="geology", placement="toolbar",
@@ -153,7 +159,9 @@ class PluginSettings:
     KEY_LANGUAGE = "language"
     KEY_GROUPS = "groups_json"
     KEY_SARV_MATCHES = "sarv_matches_json"
+    KEY_CORE_CORRECTIONS = "core_box_corrections_json"
     KEY_EGT_DATA_SOURCE = "egt_data_source"
+    KEY_VEKA_STYLE = "veka_style_json"
 
     @classmethod
     def load_layers(cls):
@@ -188,10 +196,10 @@ class PluginSettings:
             if item.code in present:
                 continue
             definition = LayerDefinition.from_dict(item.to_dict())
-            if item.code == "SK":
+            if item.code in {"SK", "VK"}:
                 after = next((
                     index for index, current in reversed(list(enumerate(layers)))
-                    if current.code in {"PA", "VP"}
+                    if current.code in {"PA", "VP", "SK"}
                 ), None)
                 layers.insert(after + 1 if after is not None else len(layers), definition)
             else:
@@ -246,6 +254,24 @@ class PluginSettings:
             )
 
     @classmethod
+    def load_veka_style(cls):
+        raw = QgsSettings().value(
+            f"{cls.ORGANIZATION}/{cls.KEY_VEKA_STYLE}", "", type=str,
+        )
+        try:
+            value = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            value = {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def save_veka_style(cls, value):
+        QgsSettings().setValue(
+            f"{cls.ORGANIZATION}/{cls.KEY_VEKA_STYLE}",
+            json.dumps(value or {}, ensure_ascii=False),
+        )
+
+    @classmethod
     def load_groups(cls):
         raw = QgsSettings().value(f"{cls.ORGANIZATION}/{cls.KEY_GROUPS}", "", type=str)
         try:
@@ -277,4 +303,22 @@ class PluginSettings:
         QgsSettings().setValue(
             f"{cls.ORGANIZATION}/{cls.KEY_SARV_MATCHES}",
             json.dumps(matches, ensure_ascii=False),
+        )
+
+    @classmethod
+    def load_core_corrections(cls):
+        raw = QgsSettings().value(
+            f"{cls.ORGANIZATION}/{cls.KEY_CORE_CORRECTIONS}", "", type=str,
+        )
+        try:
+            values = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            values = {}
+        return values if isinstance(values, dict) else {}
+
+    @classmethod
+    def save_core_corrections(cls, corrections):
+        QgsSettings().setValue(
+            f"{cls.ORGANIZATION}/{cls.KEY_CORE_CORRECTIONS}",
+            json.dumps(corrections or {}, ensure_ascii=False),
         )
