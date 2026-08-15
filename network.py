@@ -2,41 +2,84 @@
 
 import json
 from urllib.parse import quote, urlencode
-from xml.etree import ElementTree
 
-from qgis.PyQt.QtCore import QUrl, QUrlQuery
+from qgis.PyQt.QtCore import QUrl, QUrlQuery, QXmlStreamReader
 from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 from qgis.core import QgsNetworkAccessManager
+
+from .stratigraphy import STRATIGRAPHIC_INDEX_SET
 
 
 AUQ_REST = "https://gis.egt.ee/arcgis/rest/services/AUQ_public/AUQ_webapp_open/MapServer"
 EGT_WFS = "https://maps.egt.ee/geoserver/faktika/ows"
 GEA_API = "https://gea-api.egt.ee"
 SARV_API = "https://rwapi.geoloogia.info/api/v1/public"
-
-
-def _local_name(tag):
-    return tag.rsplit("}", 1)[-1]
+EELIS_API = "https://keskkonnaandmed.envir.ee"
+MAX_CAPABILITIES_BYTES = 20 * 1024 * 1024
+MAX_HTML_BYTES = 8 * 1024 * 1024
 
 
 def parse_capabilities(payload, protocol):
     """Return ``(name, title)`` tuples from a WMS or WFS capabilities document."""
-    root = ElementTree.fromstring(payload)
+    if len(payload) > MAX_CAPABILITIES_BYTES:
+        raise ValueError(
+            "Capabilities XML exceeds the 20 MB safety limit."
+        )
+
+    reader = QXmlStreamReader(payload)
+    # Keep entity expansion deliberately small and reject DTD/entity tokens
+    # below. GetCapabilities documents do not need custom entities.
+    reader.setEntityExpansionLimit(1024)
     result = []
     wanted_parent = "Layer" if protocol.upper() == "WMS" else "FeatureType"
-    for element in root.iter():
-        if _local_name(element.tag) != wanted_parent:
-            continue
-        name = ""
-        title = ""
-        for child in list(element):
-            tag = _local_name(child.tag)
-            if tag == "Name" and child.text:
-                name = child.text.strip()
-            elif tag == "Title" and child.text:
-                title = child.text.strip()
-        if name:
-            result.append((name, title or name))
+    records = []
+    depth = 0
+
+    while not reader.atEnd():
+        token = reader.readNext()
+        if token in (
+            QXmlStreamReader.TokenType.DTD,
+            QXmlStreamReader.TokenType.EntityReference,
+        ):
+            raise ValueError(
+                "DTD and custom XML entities are not allowed in capabilities."
+            )
+        if token == QXmlStreamReader.TokenType.StartElement:
+            depth += 1
+            tag = str(reader.name())
+            if tag == wanted_parent:
+                records.append({"depth": depth, "name": "", "title": ""})
+            elif (
+                records
+                and depth == records[-1]["depth"] + 1
+                and tag in {"Name", "Title"}
+            ):
+                text = reader.readElementText(
+                    QXmlStreamReader.ReadElementTextBehaviour.SkipChildElements
+                ).strip()
+                records[-1][tag.casefold()] = text
+                # readElementText() leaves the reader on this element's end.
+                depth -= 1
+        elif token == QXmlStreamReader.TokenType.EndElement:
+            tag = str(reader.name())
+            if (
+                records
+                and depth == records[-1]["depth"]
+                and tag == wanted_parent
+            ):
+                record = records.pop()
+                if record["name"]:
+                    result.append((
+                        record["name"],
+                        record["title"] or record["name"],
+                    ))
+            depth = max(0, depth - 1)
+
+    if reader.hasError():
+        raise ValueError(
+            f"Invalid capabilities XML: {reader.errorString()} "
+            f"(line {reader.lineNumber()}, column {reader.columnNumber()})."
+        )
     return result
 
 
@@ -58,11 +101,22 @@ class NetworkClient:
             url,
             lambda data: success(parse_capabilities(data, protocol)),
             failure,
+            max_bytes=MAX_CAPABILITIES_BYTES,
         )
 
     def get_json(self, url, success, failure):
         target = url if isinstance(url, QUrl) else QUrl(url)
         self._get(target, lambda data: success(json.loads(bytes(data).decode("utf-8"))), failure)
+
+    def get_text(self, url, success, failure, max_bytes=MAX_HTML_BYTES):
+        """Load a bounded public HTML/text response as UTF-8."""
+        target = url if isinstance(url, QUrl) else QUrl(url)
+        self._get(
+            target,
+            lambda data: success(bytes(data).decode("utf-8", errors="replace")),
+            failure,
+            max_bytes=max_bytes,
+        )
 
     def query_auq(self, table_id, where, success, failure, order_by=""):
         url = QUrl(f"{AUQ_REST}/{table_id}/query")
@@ -74,6 +128,55 @@ class NetworkClient:
         query.addQueryItem("resultRecordCount", "2000")
         if order_by:
             query.addQueryItem("orderByFields", order_by)
+        url.setQuery(query)
+        self.get_json(url, success, failure)
+
+    def query_auq_all(
+        self, table_id, where, fields, success, failure, order_by="objectid",
+        page_size=2000,
+    ):
+        """Load every page of an ArcGIS table query."""
+        rows = []
+
+        def load_page(offset):
+            url = QUrl(f"{AUQ_REST}/{table_id}/query")
+            query = QUrlQuery()
+            for key, value in (
+                ("f", "json"),
+                ("where", where),
+                ("outFields", ",".join(fields) if fields else "*"),
+                ("returnGeometry", "false"),
+                ("resultOffset", str(offset)),
+                ("resultRecordCount", str(page_size)),
+            ):
+                query.addQueryItem(key, value)
+            if order_by:
+                query.addQueryItem("orderByFields", order_by)
+            url.setQuery(query)
+
+            def decoded(payload):
+                if payload.get("error"):
+                    failure(payload["error"].get("message", "AUQ query failed"))
+                    return
+                page = [
+                    feature.get("attributes", {})
+                    for feature in payload.get("features", [])
+                ]
+                rows.extend(page)
+                if len(page) >= page_size or payload.get("exceededTransferLimit"):
+                    load_page(offset + len(page))
+                else:
+                    success(rows)
+
+            self.get_json(url, decoded, failure)
+
+        load_page(0)
+
+    def query_auq_metadata(self, table_id, success, failure):
+        """Load ArcGIS layer/table metadata, including coded-value domains."""
+        url = QUrl(f"{AUQ_REST}/{table_id}")
+        query = QUrlQuery()
+        query.addQueryItem("f", "json")
         url.setQuery(query)
         self.get_json(url, success, failure)
 
@@ -122,6 +225,97 @@ class NetworkClient:
         url.setQuery(query)
         self.get_json(url, success, failure)
 
+    def query_sarv_all(self, resource, fields, success, failure, limit=5000):
+        """Load every page of a compact SARV public-API collection."""
+        rows = []
+        path = str(resource).strip("/")
+        url = QUrl(f"{SARV_API}/{path}/")
+        query = QUrlQuery()
+        query.addQueryItem("fields", ",".join(fields))
+        query.addQueryItem("limit", str(limit))
+        url.setQuery(query)
+
+        def load_page(target):
+            def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid SARV response")
+                    return
+                rows.extend(payload.get("results", []))
+                next_url = payload.get("next")
+                if next_url:
+                    load_page(QUrl(str(next_url)))
+                else:
+                    success(rows)
+
+            self.get_json(target, decoded, failure)
+
+        load_page(url)
+
+    def query_sarv_pages(
+        self, resource, parameters, fields, success, failure, limit=5000,
+    ):
+        """Load all pages of a filtered SARV collection."""
+        rows = []
+        path = str(resource).strip("/")
+        url = QUrl(f"{SARV_API}/{path}/")
+        query = QUrlQuery()
+        for key, value in parameters.items():
+            if value not in (None, "", []):
+                query.addQueryItem(key, str(value))
+        if fields:
+            query.addQueryItem("fields", ",".join(fields))
+        query.addQueryItem("limit", str(limit))
+        url.setQuery(query)
+
+        def load_page(target):
+            def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid SARV response")
+                    return
+                rows.extend(payload.get("results", []))
+                next_url = payload.get("next")
+                if next_url:
+                    load_page(QUrl(str(next_url)))
+                else:
+                    success(rows)
+
+            self.get_json(target, decoded, failure)
+
+        load_page(url)
+
+    def query_eelis_pages(
+        self, resource, parameters, fields, success, failure, limit=20000,
+    ):
+        """Load all pages from an EELIS PostgREST public-API resource."""
+        rows = []
+        path = str(resource).strip("/")
+
+        def load_page(offset):
+            url = QUrl(f"{EELIS_API}/{path}")
+            query = QUrlQuery()
+            if fields:
+                query.addQueryItem("select", ",".join(fields))
+            for key, value in (parameters or {}).items():
+                if value not in (None, "", []):
+                    query.addQueryItem(str(key), str(value))
+            query.addQueryItem("limit", str(limit))
+            query.addQueryItem("offset", str(offset))
+            url.setQuery(query)
+
+            def decoded(payload):
+                if not isinstance(payload, list):
+                    failure("Invalid EELIS API response")
+                    return
+                rows.extend(payload)
+                if len(payload) >= limit:
+                    load_page(offset + len(payload))
+                else:
+                    success(rows)
+
+            self.get_json(url, decoded, failure)
+
+        load_page(0)
+
     def query_geological_units(self, role, global_id, success, failure):
         """Load the selected object's depth intervals from EGT WFS as GeoJSON."""
         type_name = (
@@ -151,6 +345,154 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
+    def query_egt_object(
+        self, role, key_type, key_value, success, failure,
+    ):
+        """Resolve a persisted EGT key to current WFS object attributes."""
+        type_name = (
+            "faktika:puurauk"
+            if role == "boreholes" else "faktika:Vaatluspunkt"
+        )
+        value = str(key_value or "").strip()
+        if key_type == "gea":
+            if not value.isdigit():
+                failure("Invalid GEA ID")
+                return
+            cql_filter = f"gea_id={value}"
+        else:
+            safe = value.replace("'", "''")
+            cql_filter = f"esri_globalid='{safe}'"
+        url = QUrl(EGT_WFS)
+        query = QUrlQuery()
+        for key, parameter in (
+            ("service", "WFS"),
+            ("version", "2.0.0"),
+            ("request", "GetFeature"),
+            ("typeNames", type_name),
+            ("outputFormat", "application/json"),
+            ("count", "2"),
+            ("CQL_FILTER", cql_filter),
+        ):
+            query.addQueryItem(key, parameter)
+        url.setQuery(query)
+
+        def decoded(payload):
+            features = payload.get("features", [])
+            if not features:
+                failure(f"EGT object {value} was not found")
+                return
+            success(features[0].get("properties", {}))
+
+        self.get_json(url, decoded, failure)
+
+    def query_stratigraphic_parent_ids(
+        self, indices, success, failure, page_size=1000, contains="",
+    ):
+        """Return EGT UUIDs matching selected and/or partial unit indices."""
+        selected = sorted({
+            str(index).strip()
+            for index in indices
+            if str(index).strip() in STRATIGRAPHIC_INDEX_SET
+        })
+        contains = str(contains or "").strip()
+        if not selected and not contains:
+            success(set())
+            return
+
+        # Keep URLs short even when many checkboxes are selected.
+        batches = [
+            selected[offset:offset + 20]
+            for offset in range(0, len(selected), 20)
+        ] or [[]]
+        type_names = (
+            "faktika:puurauk_geoloogiline_yksus",
+            "faktika:vaatluspunkt_geoloogiline_yksus",
+        )
+        tasks = [
+            (type_name, batch)
+            for type_name in type_names
+            for batch in batches
+        ]
+        parent_ids = set()
+
+        def load_task(task_index, start_index=0):
+            if task_index >= len(tasks):
+                success(parent_ids)
+                return
+            type_name, batch = tasks[task_index]
+            selected_clauses = []
+            for index in batch:
+                safe = index.replace("'", "''")
+                selected_clauses.append(
+                    "("
+                    f"indeks ILIKE '{safe}%' OR "
+                    f"liityksus_indeks_ylemine ILIKE '{safe}%' OR "
+                    f"liityksus_indeks_alumine ILIKE '{safe}%'"
+                    ")"
+                )
+            filters = []
+            if selected_clauses:
+                filters.append("(" + " OR ".join(selected_clauses) + ")")
+            if contains:
+                safe_contains = contains.replace("'", "''")
+                filters.append(
+                    "("
+                    f"indeks ILIKE '%{safe_contains}%' OR "
+                    f"liityksus_indeks_ylemine ILIKE '%{safe_contains}%' OR "
+                    f"liityksus_indeks_alumine ILIKE '%{safe_contains}%'"
+                    ")"
+                )
+            url = QUrl(EGT_WFS)
+            query = QUrlQuery()
+            for key, value in (
+                ("service", "WFS"),
+                ("version", "2.0.0"),
+                ("request", "GetFeature"),
+                ("typeNames", type_name),
+                ("outputFormat", "application/json"),
+                ("propertyName", "puurauk_vaatluspunkt_id"),
+                ("count", str(page_size)),
+                ("startIndex", str(start_index)),
+                ("CQL_FILTER", " AND ".join(filters)),
+            ):
+                query.addQueryItem(key, value)
+            url.setQuery(query)
+
+            def decoded(payload):
+                if not isinstance(payload, dict):
+                    failure("Invalid EGT WFS response")
+                    return
+                features = payload.get("features", [])
+                for feature in features:
+                    value = (
+                        feature.get("properties", {})
+                        .get("puurauk_vaatluspunkt_id")
+                    )
+                    if value not in (None, ""):
+                        parent_ids.add(str(value).upper())
+                next_index = start_index + len(features)
+                try:
+                    number_matched = int(payload.get("numberMatched"))
+                except (TypeError, ValueError):
+                    number_matched = None
+                # GeoServer currently caps this endpoint at 1000 rows even
+                # when a larger WFS ``count`` is requested.  Honour the
+                # response total when available and retain page-size fallback
+                # semantics for servers which omit ``numberMatched``.
+                has_more = (
+                    next_index < number_matched
+                    if number_matched is not None
+                    else len(features) >= page_size
+                )
+                if features and has_more:
+                    load_task(task_index, next_index)
+                else:
+                    load_task(task_index + 1)
+
+            self.get_json(url, decoded, failure)
+
+        load_task(0)
+
     def query_borehole_profile(self, global_id, success, failure):
         """Load a borehole and its nested geology from EGT's public GEA API."""
         encoded_id = quote(str(global_id), safe="")
@@ -162,23 +504,37 @@ class NetworkClient:
 
         self.get_json(url, decoded, failure)
 
-    def _get(self, url, success, failure):
+    def _get(self, url, success, failure, max_bytes=None):
         request = QNetworkRequest(url)
         request.setHeader(
             QNetworkRequest.KnownHeaders.UserAgentHeader,
-            "QGIS Qeoloog/3.4.3",
+            "QGIS Qeoloog/3.18.1",
         )
         reply = self._manager.get(request)
         self._replies.add(reply)
+        limit_exceeded = {"value": False}
+
+        if max_bytes:
+            def enforce_size_limit(received, total):
+                if (
+                    received > max_bytes
+                    or total > max_bytes
+                ):
+                    limit_exceeded["value"] = True
+                    reply.abort()
+
+            reply.downloadProgress.connect(enforce_size_limit)
 
         def finished():
             self._replies.discard(reply)
             try:
-                if reply.error() != QNetworkReply.NetworkError.NoError:
+                if limit_exceeded["value"]:
+                    failure("Response exceeds the configured safety limit.")
+                elif reply.error() != QNetworkReply.NetworkError.NoError:
                     failure(reply.errorString())
                 else:
                     success(reply.readAll())
-            except (ValueError, ElementTree.ParseError, json.JSONDecodeError) as error:
+            except (ValueError, json.JSONDecodeError) as error:
                 failure(str(error))
             finally:
                 reply.deleteLater()

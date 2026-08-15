@@ -5,20 +5,25 @@ from html import escape as html_escape
 from math import floor, log10
 from urllib.parse import quote
 
-from qgis.PyQt.QtCore import QSize, Qt, QUrl
+from qgis.PyQt.QtCore import QSize, Qt, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPen
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QMenu,
     QPushButton,
@@ -27,12 +32,252 @@ from qgis.PyQt.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
+from .corrections import core_correction_key, core_values
 from .i18n import field_label
 from .models import GROUPS, LayerDefinition
+from .stratigraphy import STRATIGRAPHIC_INDICES
+from .cross_section_widget import CrossSectionLauncher, CrossSectionWindow
+from .export_widget import ExportWidget
+
+
+def _table_sort_key(value):
+    """Return a stable key for numeric, date and textual table values."""
+    if isinstance(value, bool):
+        return (2, str(value).casefold())
+    if isinstance(value, (int, float)):
+        return (0, float(value))
+    text = _display_value(value).strip()
+    if not text:
+        return (3, "")
+    numeric = text.replace(" ", "").replace(",", ".")
+    try:
+        return (0, float(numeric))
+    except ValueError:
+        pass
+    for pattern in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            source = text[:19] if "T" in pattern else text
+            parsed = datetime.strptime(source, pattern)
+            return (
+                1, parsed.toordinal(), parsed.hour,
+                parsed.minute, parsed.second, parsed.microsecond,
+            )
+        except (OSError, ValueError):
+            continue
+    return (2, text.casefold())
+
+
+class SortableTableItem(QTableWidgetItem):
+    """QTableWidget item that sorts numbers and dates by their real values."""
+
+    def __init__(self, value):
+        display = _display_value(value)
+        super().__init__(display)
+        self._qeoloog_sort_key = _table_sort_key(value)
+
+    def __lt__(self, other):
+        if isinstance(other, SortableTableItem):
+            return self._qeoloog_sort_key < other._qeoloog_sort_key
+        return super().__lt__(other)
+
+
+class CoreCorrectionDialog(QDialog):
+    """Edit one drill-core box using standardized local fields."""
+
+    def __init__(self, plugin, source, record_id, values, parent=None):
+        super().__init__(parent)
+        self.plugin = plugin
+        self.setWindowTitle(plugin.t("Muuda puursüdamiku kasti"))
+        layout = QVBoxLayout(self)
+        note = QLabel(plugin.t(
+            "Muudatus salvestatakse ainult sellesse arvutisse; EGT ega "
+            "SARV algandmeid ei muudeta."
+        ))
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        source_label = QLabel(str(source))
+        source_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        identifier_label = QLabel(str(record_id))
+        identifier_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        form.addRow(plugin.t("Allikas"), source_label)
+        form.addRow(plugin.t("Kirje ID"), identifier_label)
+        self.edits = {}
+        for key, label in (
+            ("number", "Kasti number"),
+            ("top", "Ülemine sügavus, m"),
+            ("bottom", "Alumine sügavus, m"),
+            ("diameter", "Diameeter"),
+            ("status", "Staatus / hoiukoht"),
+        ):
+            edit = QLineEdit()
+            value = (values or {}).get(key)
+            edit.setText("" if value in (None, "") else str(value))
+            if key in {"top", "bottom", "diameter"}:
+                edit.setPlaceholderText(plugin.t("Jäta tühjaks, kui puudub"))
+            self.edits[key] = edit
+            form.addRow(plugin.t(label), edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._values = None
+
+    def _validate_and_accept(self):
+        values = {}
+        for key, edit in self.edits.items():
+            text = edit.text().strip()
+            if key not in {"top", "bottom", "diameter"}:
+                values[key] = text or None
+                continue
+            if not text:
+                values[key] = None
+                continue
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                QMessageBox.warning(
+                    self, self.plugin.t("Vigane väärtus"),
+                    self.plugin.t("Sügavus ja diameeter peavad olema arvud."),
+                )
+                return
+            if value < 0:
+                QMessageBox.warning(
+                    self, self.plugin.t("Vigane väärtus"),
+                    self.plugin.t("Sügavus ja diameeter ei saa olla negatiivsed."),
+                )
+                return
+            values[key] = value
+        top, bottom = values.get("top"), values.get("bottom")
+        if top is not None and bottom is not None and bottom <= top:
+            QMessageBox.warning(
+                self, self.plugin.t("Vigane väärtus"),
+                self.plugin.t(
+                    "Alumine sügavus peab olema ülemisest sügavusest suurem."
+                ),
+            )
+            return
+        self._values = values
+        self.accept()
+
+    def values(self):
+        return dict(self._values or {})
+
+
+class MultiSelectButton(QToolButton):
+    """Scrollable multi-select that remains open while options are checked."""
+
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, all_text, parent=None):
+        super().__init__(parent)
+        self.all_text = all_text
+        self._items = {}
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self)
+        host = QWidget(menu)
+        host.setMinimumWidth(320)
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(6, 6, 6, 6)
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Filter…")
+        self._search.textChanged.connect(self._filter)
+        host_layout.addWidget(self._search)
+        self._list = QListWidget()
+        self._list.setMinimumHeight(120)
+        self._list.setMaximumHeight(300)
+        self._list.itemChanged.connect(self._changed)
+        host_layout.addWidget(self._list)
+        clear_button = QPushButton("×")
+        clear_button.setToolTip(all_text)
+        clear_button.clicked.connect(self.clear_selection)
+        host_layout.addWidget(clear_button)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(host)
+        menu.addAction(action)
+        self.setMenu(menu)
+        self._update_text()
+
+    def set_options(self, options):
+        selected = self.selected_values()
+        self._list.blockSignals(True)
+        self._list.clear()
+        self._items = {}
+        for value, label in options:
+            item = QListWidgetItem(str(label), self._list)
+            item.setData(Qt.ItemDataRole.UserRole, str(value))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if str(value) in selected else Qt.CheckState.Unchecked
+            )
+            self._items[str(value)] = item
+        self._list.blockSignals(False)
+        self._filter(self._search.text())
+        self._update_text()
+
+    def selected_values(self):
+        return {
+            value for value, item in self._items.items()
+            if item.checkState() == Qt.CheckState.Checked
+        }
+
+    def clear_selection(self):
+        self._list.blockSignals(True)
+        for item in self._items.values():
+            item.setCheckState(Qt.CheckState.Unchecked)
+        self._list.blockSignals(False)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def set_selected_values(self, values):
+        selected = {str(value) for value in values}
+        self._list.blockSignals(True)
+        for value, item in self._items.items():
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if value in selected else Qt.CheckState.Unchecked
+            )
+        self._list.blockSignals(False)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _changed(self, _item=None):
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _filter(self, text):
+        needle = str(text or "").casefold()
+        for item in self._items.values():
+            item.setHidden(needle not in item.text().casefold())
+
+    def _update_text(self):
+        selected = [
+            item.text() for item in self._items.values()
+            if item.checkState() == Qt.CheckState.Checked
+        ]
+        if not selected:
+            text = self.all_text
+        elif len(selected) <= 2:
+            text = ", ".join(selected)
+        else:
+            text = f"{len(selected)}"
+        self.setText(text)
+        self.setToolTip(", ".join(selected) if selected else self.all_text)
 
 
 class LayerConfigWidget(QWidget):
@@ -73,6 +318,29 @@ class LayerConfigWidget(QWidget):
         preferences_layout.addLayout(group_row)
         layout.addWidget(preferences)
 
+        egt_source = QGroupBox(t("EGT detailandmete allikas"))
+        egt_source_layout = QFormLayout(egt_source)
+        self.egt_data_source = QComboBox()
+        self.egt_data_source.addItem(t("WFS – kiirem laadimine"), "wfs")
+        self.egt_data_source.addItem(t("API – kiiremini uuenevad andmed"), "api")
+        self.egt_data_source.setCurrentIndex(
+            self.egt_data_source.findData(self.plugin.egt_data_source)
+        )
+        self.egt_data_source.currentIndexChanged.connect(
+            lambda: self.plugin.set_egt_data_source(
+                self.egt_data_source.currentData()
+            )
+        )
+        egt_source_layout.addRow(t("Puuraugud ja vaatluspunktid"), self.egt_data_source)
+        egt_note = QLabel(t(
+            "API valik kasutab puuraukudel GEA API-t. Vaatluspunktide "
+            "detailandmeid avalik GEA API praegu ei paku, seega kasutatakse "
+            "nende puhul WFS-i."
+        ))
+        egt_note.setWordWrap(True)
+        egt_source_layout.addRow(egt_note)
+        layout.addWidget(egt_source)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(splitter)
 
@@ -99,7 +367,7 @@ class LayerConfigWidget(QWidget):
         form_host_layout = QVBoxLayout(form_host)
         form = QFormLayout()
         self.protocol = QComboBox()
-        self.protocol.addItems(["WMS", "WFS"])
+        self.protocol.addItems(["WMS", "WFS", "SARV", "VEKA"])
         self.code = QLineEdit()
         self.code.setMaxLength(4)
         self.name = QLineEdit()
@@ -161,8 +429,21 @@ class LayerConfigWidget(QWidget):
         self.toggle_mode.setChecked(self.plugin.toggle_mode)
         self.toggle_mode.toggled.connect(self.plugin.set_toggle_mode)
         form_host_layout.addWidget(self.toggle_mode)
+        export_button = QPushButton(t("Ekspordi SARV seosed…"))
+        export_button.clicked.connect(self._export_sarv_matches)
+        form_host_layout.addWidget(export_button)
         splitter.addWidget(form_host)
         splitter.setSizes([220, 360])
+
+    def _export_sarv_matches(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.plugin.t("Ekspordi SARV seosed"),
+            "qeoloog_sarv_seosed.csv",
+            "CSV (*.csv);;JSON (*.json)",
+        )
+        if path:
+            self.plugin.export_sarv_matches(path)
 
     def reload_list(self, select=None):
         self.list_widget.blockSignals(True)
@@ -258,6 +539,13 @@ class LayerConfigWidget(QWidget):
                 "Enter the service URL." if self.plugin.language == "en" else "Sisesta teenuse URL."
             )
             return
+        if self.protocol.currentText().upper() in {"SARV", "VEKA"}:
+            self.plugin.message(
+                "This point catalog is fixed and does not use GetCapabilities."
+                if self.plugin.language == "en"
+                else "See punktikataloog on fikseeritud ega kasuta GetCapabilities päringut."
+            )
+            return
         self.plugin.message(
             "Loading the service layer list..." if self.plugin.language == "en"
             else "Teenuse kihtide loendit laaditakse..."
@@ -306,7 +594,11 @@ class LayerConfigWidget(QWidget):
             return
         lower_name = layer_name.lower()
         role = ""
-        if lower_name.endswith(":puurauk") or lower_name == "puurauk":
+        if protocol == "SARV":
+            role = "sarv_points"
+        elif protocol == "VEKA":
+            role = "veka_boreholes"
+        elif lower_name.endswith(":puurauk") or lower_name == "puurauk":
             role = "boreholes"
         elif lower_name.endswith(":vaatluspunkt") or lower_name == "vaatluspunkt":
             role = "observations"
@@ -367,6 +659,9 @@ class FilterWidget(QWidget):
     def __init__(self, plugin):
         super().__init__()
         self.plugin = plugin
+        self._resetting = False
+        self._pending_analysis_code = ""
+        self._pending_analysis_code = ""
         t = plugin.t
         layout = QVBoxLayout(self)
 
@@ -390,6 +685,20 @@ class FilterWidget(QWidget):
             category_layout.addWidget(checkbox)
         layout.addWidget(category_group)
 
+        index_group = QGroupBox(t("Indeksi filtrid"))
+        index_layout = QFormLayout(index_group)
+        self.stratigraphic_index = MultiSelectButton(t("Kõik"))
+        self.stratigraphic_index.set_options(
+            (index, index) for index in STRATIGRAPHIC_INDICES
+        )
+        self.stratigraphic_index.selectionChanged.connect(self._changed)
+        self.stratigraphic_contains = QLineEdit()
+        self.stratigraphic_contains.setPlaceholderText(t("Sisaldab"))
+        self.stratigraphic_contains.editingFinished.connect(self._changed)
+        index_layout.addRow(t("Indeks"), self.stratigraphic_index)
+        index_layout.addRow(t("Sisaldab"), self.stratigraphic_contains)
+        layout.addWidget(index_group)
+
         related_group = QGroupBox(t("Seotud andmed"))
         related_layout = QFormLayout(related_group)
         self.related = {}
@@ -408,10 +717,42 @@ class FilterWidget(QWidget):
             related_layout.addRow(t(title), choice)
         layout.addWidget(related_group)
 
+        sample_group = QGroupBox(t("Proovide filtrid"))
+        sample_layout = QFormLayout(sample_group)
+        self.sample_filters = {}
+        for field, title in (
+            ("proov_tyyp", "Proovi tüüp"),
+            ("eesmark", "Proovi eesmärk"),
+            ("staatus", "Proovi staatus"),
+        ):
+            choice = MultiSelectButton(t("Kõik"))
+            choice.selectionChanged.connect(self._changed)
+            self.sample_filters[field] = choice
+            sample_layout.addRow(t(title), choice)
+        layout.addWidget(sample_group)
+
+        analysis_group = QGroupBox(t("Analüüside filtrid"))
+        analysis_layout = QFormLayout(analysis_group)
+        self.analysis_filters = {}
+        for table_id, field, title in (
+            (3, "analyys_meetod", "Analüüsi meetod"),
+            (3, "labor", "Analüüsi labor"),
+            (4, "analyys_tulem_tyyp", "Tulemuse tüüp"),
+            (4, "analyys_naitaja", "Analüüsi näitaja"),
+        ):
+            choice = MultiSelectButton(t("Kõik"))
+            choice.selectionChanged.connect(self._changed)
+            self.analysis_filters[(table_id, field)] = choice
+            analysis_layout.addRow(t(title), choice)
+        layout.addWidget(analysis_group)
+
         self.identify_button = QPushButton(t("Klõpsa objektil ja ava andmed"))
         self.identify_button.setCheckable(True)
         self.identify_button.toggled.connect(self.plugin.set_identify_active)
         layout.addWidget(self.identify_button)
+        reset_button = QPushButton(t("Lähtesta"))
+        reset_button.clicked.connect(self.reset)
+        layout.addWidget(reset_button)
         note = QLabel(
             ("Borehole and observation-point filters apply to WFS vector layers. "
              "The observation-point dataset currently contains no basement records."
@@ -427,8 +768,29 @@ class FilterWidget(QWidget):
         self.observations.stateChanged.connect(self._changed)
         for checkbox in self.categories.values():
             checkbox.stateChanged.connect(self._changed)
+        self.reload_domain_options()
 
     def _changed(self):
+        if not self._resetting:
+            self.plugin.apply_egt_filters()
+
+    def reset(self):
+        self._resetting = True
+        try:
+            self.boreholes.setChecked(True)
+            self.observations.setChecked(True)
+            for checkbox in self.categories.values():
+                checkbox.setChecked(True)
+            self.stratigraphic_index.clear_selection()
+            self.stratigraphic_contains.clear()
+            for choice in self.related.values():
+                choice.setCurrentIndex(0)
+            for choice in self.sample_filters.values():
+                choice.clear_selection()
+            for choice in self.analysis_filters.values():
+                choice.clear_selection()
+        finally:
+            self._resetting = False
         self.plugin.apply_egt_filters()
 
     def selected_codes(self):
@@ -437,10 +799,732 @@ class FilterWidget(QWidget):
     def related_requirements(self):
         return {key: choice.currentData() for key, choice in self.related.items()}
 
+    def stratigraphic_requirements(self):
+        return {
+            "indices": self.stratigraphic_index.selected_values(),
+            "contains": self.stratigraphic_contains.text().strip(),
+        }
+
+    def egt_domain_requirements(self):
+        return {
+            "samples": {
+                field: choice.selected_values()
+                for field, choice in self.sample_filters.items()
+            },
+            "analyses": {
+                key: choice.selected_values()
+                for key, choice in self.analysis_filters.items()
+            },
+        }
+
+    def reload_domain_options(self):
+        for field, choice in self.sample_filters.items():
+            choice.set_options(self.plugin.egt_options(18, field))
+        for (table_id, field), choice in self.analysis_filters.items():
+            choice.set_options(self.plugin.egt_options(table_id, field))
+
     def set_identify_checked(self, checked):
         self.identify_button.blockSignals(True)
         self.identify_button.setChecked(checked)
         self.identify_button.blockSignals(False)
+
+
+class SarvFilterWidget(QWidget):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self._resetting = False
+        t = plugin.t
+        layout = QVBoxLayout(self)
+
+        kinds = QGroupBox(t("Objekti liigid"))
+        kinds_layout = QVBoxLayout(kinds)
+        self.kinds = {}
+        for role, title in (
+            ("sarv_localities", "Lokaliteedid"),
+            ("sarv_sites", "Uuringupunktid"),
+            ("sarv_drillcores", "Puursüdamikud"),
+        ):
+            checkbox = QCheckBox(t(title))
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._changed)
+            self.kinds[role] = checkbox
+            kinds_layout.addWidget(checkbox)
+        layout.addWidget(kinds)
+
+        extent_group = QGroupBox(t("Asukoht ja sügavus"))
+        extent_layout = QFormLayout(extent_group)
+        self.current_extent = QCheckBox(t("Ainult kaardi praegune ulatus"))
+        self.current_extent.toggled.connect(self._changed)
+        extent_layout.addRow(self.current_extent)
+        self.depth_min = QLineEdit()
+        self.depth_max = QLineEdit()
+        self.depth_min.setPlaceholderText("0")
+        self.depth_max.setPlaceholderText("m")
+        self.depth_min.editingFinished.connect(self._changed)
+        self.depth_max.editingFinished.connect(self._changed)
+        extent_layout.addRow(t("Min sügavus"), self.depth_min)
+        extent_layout.addRow(t("Max sügavus"), self.depth_max)
+        layout.addWidget(extent_group)
+
+        related_group = QGroupBox(t("Seotud andmed"))
+        related_layout = QFormLayout(related_group)
+        self.related = {}
+        for key, title in (
+            ("core", "Puursüdamik olemas"),
+            ("samples", "Proovid olemas"),
+            ("analyses", "Analüüsid olemas"),
+            ("specimens", "Eksemplarid olemas"),
+        ):
+            choice = QComboBox()
+            choice.addItem(t("Kõik"), "any")
+            choice.addItem(t("Jah"), "yes")
+            choice.addItem(t("Ei"), "no")
+            choice.currentIndexChanged.connect(self._changed)
+            self.related[key] = choice
+            related_layout.addRow(t(title), choice)
+        layout.addWidget(related_group)
+
+        sample_group = QGroupBox(t("Proovide filtrid"))
+        sample_layout = QFormLayout(sample_group)
+        self.sample_purpose = MultiSelectButton(t("Kõik"))
+        self.sample_type = MultiSelectButton(t("Kõik"))
+        self.sample_purpose.set_options(plugin.sarv_purpose_options())
+        self.sample_purpose.selectionChanged.connect(self._changed)
+        self.sample_type.selectionChanged.connect(self._changed)
+        sample_layout.addRow(t("Proovi eesmärk"), self.sample_purpose)
+        sample_layout.addRow(t("Proovi tüüp"), self.sample_type)
+        layout.addWidget(sample_group)
+
+        analysis_group = QGroupBox(t("Analüüside filtrid"))
+        analysis_layout = QFormLayout(analysis_group)
+        self.analysis_method = MultiSelectButton(t("Kõik"))
+        self.analysis_method.selectionChanged.connect(self._changed)
+        analysis_layout.addRow(t("Analüüsi meetod"), self.analysis_method)
+        layout.addWidget(analysis_group)
+
+        specimen_group = QGroupBox(t("Eksemplaride filtrid"))
+        specimen_layout = QFormLayout(specimen_group)
+        self.specimen_type = MultiSelectButton(t("Kõik"))
+        self.specimen_type.selectionChanged.connect(self._changed)
+        specimen_layout.addRow(t("Eksemplari tüüp"), self.specimen_type)
+        layout.addWidget(specimen_group)
+
+        note = QLabel(
+            t("SARV seotud andmete filtrid päritakse vajadusel serverist. "
+              "Tühi valik tähendab kõiki väärtusi.")
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        reset_button = QPushButton(t("Lähtesta"))
+        reset_button.clicked.connect(self.reset)
+        layout.addWidget(reset_button)
+        layout.addStretch(1)
+        self.reload_options()
+
+    def reload_options(self):
+        self.analysis_method.set_options(self.plugin.sarv_analysis_options)
+        self.sample_type.set_options(self.plugin.sarv_sample_type_options)
+        self.specimen_type.set_options(
+            self.plugin.sarv_specimen_type_options
+        )
+
+    def requirements(self):
+        def number(widget):
+            try:
+                return float(widget.text().strip()) if widget.text().strip() else None
+            except ValueError:
+                return None
+
+        return {
+            "kinds": {
+                role for role, checkbox in self.kinds.items()
+                if checkbox.isChecked()
+            },
+            "current_extent": self.current_extent.isChecked(),
+            "depth_min": number(self.depth_min),
+            "depth_max": number(self.depth_max),
+            "related": {
+                key: choice.currentData() for key, choice in self.related.items()
+            },
+            "sample_purpose": self.sample_purpose.selected_values(),
+            "sample_type": self.sample_type.selected_values(),
+            "analysis_method": self.analysis_method.selected_values(),
+            "specimen_type": self.specimen_type.selected_values(),
+        }
+
+    def _changed(self):
+        if not self._resetting:
+            self.plugin.apply_sarv_filters()
+
+    def reset(self):
+        self._resetting = True
+        try:
+            for checkbox in self.kinds.values():
+                checkbox.setChecked(True)
+            self.current_extent.setChecked(False)
+            self.depth_min.clear()
+            self.depth_max.clear()
+            for choice in self.related.values():
+                choice.setCurrentIndex(0)
+            self.sample_purpose.clear_selection()
+            self.sample_type.clear_selection()
+            self.analysis_method.clear_selection()
+            self.specimen_type.clear_selection()
+        finally:
+            self._resetting = False
+        self.plugin.apply_sarv_filters()
+
+
+class VekaWidget(QWidget):
+    """VEKA well filters and a focused graduated-symbology designer."""
+
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        self._resetting = False
+        t = plugin.t
+        layout = QVBoxLayout(self)
+
+        search_group = QGroupBox(t("VEKA otsing ja filtrid"))
+        form = QFormLayout(search_group)
+        self.text = QLineEdit()
+        self.text.setPlaceholderText(t("Nimi, aadress või ID"))
+        self.text.editingFinished.connect(self._changed)
+        form.addRow(t("Otsing"), self.text)
+        self.purpose = MultiSelectButton(t("Kõik"))
+        self.groundwater = MultiSelectButton(t("Kõik"))
+        self.purpose.selectionChanged.connect(self._changed)
+        self.groundwater.selectionChanged.connect(self._changed)
+        form.addRow(t("Otstarve"), self.purpose)
+        form.addRow(t("Põhjaveekogum"), self.groundwater)
+        self.year_min, self.year_max, year_row = self._range_row(
+            t("Alates"), t("Kuni")
+        )
+        form.addRow(t("Puurimise aasta"), year_row)
+        self.filter_min, self.filter_max, filter_row = self._range_row(
+            f"{t('Min')} (m)", f"{t('Max')} (m)"
+        )
+        form.addRow(t("Filtri paigutussügavus"), filter_row)
+        self.hydro_mode = self._mode_combo(include_any=True)
+        self.hydro_mode.currentIndexChanged.connect(self._changed)
+        form.addRow(t("Mitme pumpamiskatse käsitlus"), self.hydro_mode)
+        self.debit_min, self.debit_max, debit_row = self._range_row(
+            f"{t('Min')} (l/s)", f"{t('Max')} (l/s)"
+        )
+        form.addRow(f"{t('Deebit')} (l/s)", debit_row)
+        self.specific_min, self.specific_max, specific_row = self._range_row(
+            f"{t('Min')} (l/(s·m))", f"{t('Max')} (l/(s·m))"
+        )
+        form.addRow(f"{t('Eritootlikkus')} (l/(s·m))", specific_row)
+        hydro_help = QLabel(t(
+            "Deebit on katsepumpamisel mõõdetud veehulk. Eritootlikkus = "
+            "deebit / veetaseme alandus. Valik määrab, kuidas sama puurkaevu "
+            "mitut pumpamiskatset käsitletakse."
+        ))
+        hydro_help.setWordWrap(True)
+        hydro_help.setStyleSheet("color: #6b6b6b;")
+        form.addRow(hydro_help)
+        for widget in (
+            self.year_min, self.year_max, self.filter_min, self.filter_max,
+            self.debit_min, self.debit_max, self.specific_min,
+            self.specific_max,
+        ):
+            widget.editingFinished.connect(self._changed)
+        layout.addWidget(search_group)
+
+        analysis_group = QGroupBox(t("Veeproovi tulemused"))
+        analysis_form = QFormLayout(analysis_group)
+        self.analysis = QComboBox()
+        self.analysis.setEditable(True)
+        self.analysis.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.analysis.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.analysis.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self.analysis.setMaxVisibleItems(25)
+        self.analysis.addItem(t("Kõik"), "")
+        self.analysis.currentIndexChanged.connect(self._changed)
+        analysis_form.addRow(t("Näitaja"), self.analysis)
+        self.load_analysis = QPushButton(t("Laadi veeproovi näitajad"))
+        self.load_analysis.clicked.connect(plugin.ensure_veka_analysis_options)
+        analysis_form.addRow(self.load_analysis)
+        self.analysis_mode = self._mode_combo(include_any=True)
+        self.analysis_mode.currentIndexChanged.connect(self._changed)
+        analysis_form.addRow(t("Mitme veeproovi käsitlus"), self.analysis_mode)
+        self.analysis_min, self.analysis_max, analysis_row = self._range_row("Min", "Max")
+        self.analysis_min.editingFinished.connect(self._changed)
+        self.analysis_max.editingFinished.connect(self._changed)
+        analysis_form.addRow(t("Tulemuse vahemik"), analysis_row)
+        self.analysis_year_min, self.analysis_year_max, analysis_year_row = self._range_row(
+            "Min", "Max"
+        )
+        self.analysis_year_min.editingFinished.connect(self._changed)
+        self.analysis_year_max.editingFinished.connect(self._changed)
+        analysis_form.addRow(t("Proovivõtu aasta"), analysis_year_row)
+        analysis_help = QLabel(t(
+            "Sama näitaja teisendatavad ühikud ühendatakse ja tulemused "
+            "kuvatakse valikus näidatud ühtsesse ühikusse."
+        ))
+        analysis_help.setWordWrap(True)
+        analysis_help.setStyleSheet("color: #6b6b6b;")
+        analysis_form.addRow(analysis_help)
+        layout.addWidget(analysis_group)
+
+        reset_button = QPushButton(t("Lähtesta filtrid"))
+        reset_button.clicked.connect(self.reset_filters)
+        layout.addWidget(reset_button)
+
+        style_group = QGroupBox(t("VEKA sümboloogia"))
+        style_form = QFormLayout(style_group)
+        self.style_metric = QComboBox()
+        for label, value in (
+            (t("Puurimise aasta"), "year"),
+            (t("Puuraugu sügavus"), "depth"),
+            (t("Filtri algussügavus"), "filter_top"),
+            (t("Filtri lõppsügavus"), "filter_bottom"),
+            (t("Deebit"), "debit"),
+            (t("Eritootlikkus"), "specific"),
+            (t("Valitud veeproovi näitaja"), "analysis"),
+        ):
+            self.style_metric.addItem(label, value)
+        style_form.addRow(t("Näitaja"), self.style_metric)
+        self.style_aggregation = self._mode_combo(include_any=False)
+        style_form.addRow(t("Koondamine"), self.style_aggregation)
+        self.style_method = QComboBox()
+        self.style_method.addItem(t("Värv"), "color")
+        self.style_method.addItem(t("Ikooni suurus"), "size")
+        self.style_method.addItem(t("Värv ja suurus"), "both")
+        style_form.addRow(t("Kujutusviis"), self.style_method)
+        self.style_classification = QComboBox()
+        self.style_classification.addItem(t("Kvantiilid"), "quantile")
+        self.style_classification.addItem(t("Võrdsed vahemikud"), "equal")
+        style_form.addRow(t("Klassifikatsioon"), self.style_classification)
+        self.style_palette = QComboBox()
+        self.style_palette.addItem("Viridis", "#440154|#fde725")
+        self.style_palette.addItem("Sinine–punane", "#2c7bb6|#d7191c")
+        self.style_palette.addItem("Hele–tumesinine", "#deebf7|#08519c")
+        self.style_palette.addItem("Kollane–punane", "#ffffb2|#bd0026")
+        style_form.addRow(t("Värviskaala"), self.style_palette)
+        self.style_classes = QLineEdit("5")
+        style_form.addRow(t("Klasside arv"), self.style_classes)
+        self.size_min, self.size_max, size_row = self._range_row("1.5", "7")
+        style_form.addRow(t("Ikooni suurus, mm"), size_row)
+        self.style_missing = QCheckBox(t("Kuva puuduvad andmed hallina"))
+        self.style_missing.setChecked(True)
+        style_form.addRow(self.style_missing)
+        style_buttons = QWidget()
+        style_buttons_layout = QHBoxLayout(style_buttons)
+        style_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        apply_style = QPushButton(t("Rakenda kujundus"))
+        apply_style.clicked.connect(
+            lambda: plugin.apply_veka_symbology(self.style_settings())
+        )
+        reset_style = QPushButton(t("Taasta algkujundus"))
+        reset_style.clicked.connect(plugin.reset_veka_symbology)
+        style_buttons_layout.addWidget(apply_style)
+        style_buttons_layout.addWidget(reset_style)
+        style_form.addRow(style_buttons)
+        layout.addWidget(style_group)
+
+        self.status = QLabel(t("Laadi VK kiht, et VEKA filtreid kasutada."))
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        layout.addStretch(1)
+        self.restore_style(plugin.veka_style)
+
+    @staticmethod
+    def _range_row(left_placeholder, right_placeholder):
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        left = QLineEdit()
+        right = QLineEdit()
+        left.setPlaceholderText(str(left_placeholder))
+        right.setPlaceholderText(str(right_placeholder))
+        row.addWidget(left)
+        row.addWidget(right)
+        return left, right, host
+
+    def _mode_combo(self, include_any):
+        combo = QComboBox()
+        if include_any:
+            combo.addItem(self.plugin.t("Vähemalt üks tulemus sobib"), "any")
+        combo.addItem(self.plugin.t("Uusim tulemus"), "latest")
+        combo.addItem(self.plugin.t("Suurim tulemus"), "max")
+        combo.addItem(self.plugin.t("Väikseim tulemus"), "min")
+        combo.addItem(self.plugin.t("Keskmine tulemus"), "mean")
+        return combo
+
+    @staticmethod
+    def _number(widget, integer=False):
+        text = widget.text().strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text.replace(",", "."))
+            return int(numeric) if integer else numeric
+        except ValueError:
+            return None
+
+    def requirements(self):
+        return {
+            "text": self.text.text().strip(),
+            "purposes": self.purpose.selected_values(),
+            "groundwater": self.groundwater.selected_values(),
+            "year_min": self._number(self.year_min, True),
+            "year_max": self._number(self.year_max, True),
+            "filter_min": self._number(self.filter_min),
+            "filter_max": self._number(self.filter_max),
+            "hydro_mode": self.hydro_mode.currentData(),
+            "debit_min": self._number(self.debit_min),
+            "debit_max": self._number(self.debit_max),
+            "specific_min": self._number(self.specific_min),
+            "specific_max": self._number(self.specific_max),
+            "analysis_code": self.analysis.currentData() or "",
+            "analysis_mode": self.analysis_mode.currentData(),
+            "analysis_min": self._number(self.analysis_min),
+            "analysis_max": self._number(self.analysis_max),
+            "analysis_year_min": self._number(self.analysis_year_min, True),
+            "analysis_year_max": self._number(self.analysis_year_max, True),
+        }
+
+    def style_settings(self):
+        try:
+            classes = max(1, min(12, int(self.style_classes.text())))
+        except ValueError:
+            classes = 5
+        return {
+            "metric": self.style_metric.currentData(),
+            "aggregation": self.style_aggregation.currentData(),
+            "method": self.style_method.currentData(),
+            "classification": self.style_classification.currentData(),
+            "palette": self.style_palette.currentData(),
+            "classes": classes,
+            "size_min": self._number(self.size_min) or 1.5,
+            "size_max": self._number(self.size_max) or 7.0,
+            "show_missing": self.style_missing.isChecked(),
+            "analysis_code": self.analysis.currentData() or "",
+        }
+
+    def restore_style(self, settings):
+        if not isinstance(settings, dict):
+            return
+        self._pending_analysis_code = str(settings.get("analysis_code") or "")
+        for combo, key in (
+            (self.style_metric, "metric"),
+            (self.style_aggregation, "aggregation"),
+            (self.style_method, "method"),
+            (self.style_classification, "classification"),
+            (self.style_palette, "palette"),
+        ):
+            index = combo.findData(settings.get(key))
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        if settings.get("classes"):
+            self.style_classes.setText(str(settings["classes"]))
+        if settings.get("size_min") is not None:
+            self.size_min.setText(str(settings["size_min"]))
+        if settings.get("size_max") is not None:
+            self.size_max.setText(str(settings["size_max"]))
+        if "show_missing" in settings:
+            self.style_missing.setChecked(bool(settings["show_missing"]))
+
+    def set_main_options(self, purposes, groundwater):
+        self.purpose.set_options(purposes)
+        self.groundwater.set_options(groundwater)
+
+    def set_analysis_options(self, options):
+        selected = self.analysis.currentData() or self._pending_analysis_code
+        self.analysis.blockSignals(True)
+        self.analysis.clear()
+        self.analysis.addItem(self.plugin.t("Kõik"), "")
+        for code, label in options:
+            self.analysis.addItem(label, code)
+        index = self.analysis.findData(selected)
+        if index < 0 and selected:
+            # Migrate a unit-specific selection from the initial 3.14.0 build
+            # to the new unified option when the indicator has one clear row.
+            source_code = str(selected).split("\x1f", 1)[0]
+            candidates = [
+                item_index for item_index in range(1, self.analysis.count())
+                if source_code in str(
+                    self.analysis.itemData(item_index)
+                ).split("\x1f", 1)[0].split("\x1e")
+            ]
+            if len(candidates) == 1:
+                index = candidates[0]
+                selected = self.analysis.itemData(index)
+        self.analysis.setCurrentIndex(max(0, index))
+        if index >= 0:
+            self._pending_analysis_code = str(selected)
+        self.analysis.blockSignals(False)
+        self.load_analysis.setEnabled(False)
+
+    def reset_filters(self):
+        self._resetting = True
+        try:
+            self.text.clear()
+            self.purpose.clear_selection()
+            self.groundwater.clear_selection()
+            for widget in (
+                self.year_min, self.year_max, self.filter_min, self.filter_max,
+                self.debit_min, self.debit_max, self.specific_min,
+                self.specific_max, self.analysis_min, self.analysis_max,
+                self.analysis_year_min, self.analysis_year_max,
+            ):
+                widget.clear()
+            self.hydro_mode.setCurrentIndex(0)
+            self.analysis_mode.setCurrentIndex(0)
+            self.analysis.setCurrentIndex(0)
+        finally:
+            self._resetting = False
+        self.plugin.apply_veka_filters()
+
+    def _changed(self):
+        if not self._resetting:
+            self.plugin.apply_veka_filters()
+
+
+class SearchWidget(QWidget):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+        t = plugin.t
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source = QComboBox()
+        self.source.addItem(t("EGT, SARV ja VEKA"), "all")
+        self.source.addItem(t("EGT ja SARV"), "both")
+        self.source.addItem("EGT", "egt")
+        self.source.addItem("SARV", "sarv")
+        self.source.addItem("VEKA", "veka")
+        # Preserve the established EGT + SARV default; VEKA is an opt-in
+        # dropdown layer and should not create a missing-layer warning in
+        # every existing search.
+        self.source.setCurrentIndex(self.source.findData("both"))
+        form.addRow(t("Allikas"), self.source)
+        kind_host = QWidget()
+        kind_layout = QHBoxLayout(kind_host)
+        kind_layout.setContentsMargins(0, 0, 0, 0)
+        self.kinds = {}
+        for role, label in (
+            ("boreholes", "PA"),
+            ("observations", "VP"),
+            ("sarv_localities", "SL"),
+            ("sarv_sites", "SU"),
+            ("sarv_drillcores", "SK"),
+            ("veka_boreholes", "VK"),
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.setToolTip(t({
+                "boreholes": "Puuraugud",
+                "observations": "Vaatluspunktid",
+                "sarv_localities": "Lokaliteedid",
+                "sarv_sites": "Uuringupunktid",
+                "sarv_drillcores": "Puursüdamikud",
+                "veka_boreholes": "VEKA puurkaevud",
+            }[role]))
+            self.kinds[role] = checkbox
+            kind_layout.addWidget(checkbox)
+        form.addRow(t("Objekti liigid"), kind_host)
+        self.text = QLineEdit()
+        self.text.setPlaceholderText(t("Nimi, number või ID"))
+        self.text.returnPressed.connect(self.run)
+        form.addRow(t("Otsing"), self.text)
+        self.current_extent = QCheckBox(t("Ainult kaardi praegune ulatus"))
+        form.addRow(self.current_extent)
+        depth_host = QWidget()
+        depth_layout = QHBoxLayout(depth_host)
+        depth_layout.setContentsMargins(0, 0, 0, 0)
+        self.depth_min = QLineEdit()
+        self.depth_max = QLineEdit()
+        self.depth_min.setPlaceholderText(t("Min"))
+        self.depth_max.setPlaceholderText(t("Max"))
+        depth_layout.addWidget(self.depth_min)
+        depth_layout.addWidget(self.depth_max)
+        form.addRow(t("Sügavus"), depth_host)
+        self.stratigraphic_index = MultiSelectButton(t("Kõik"))
+        self.stratigraphic_index.set_options(
+            (index, index) for index in STRATIGRAPHIC_INDICES
+        )
+        form.addRow(t("Indeks"), self.stratigraphic_index)
+        self.sample_type = MultiSelectButton(t("Kõik"))
+        self.sample_purpose = MultiSelectButton(t("Kõik"))
+        self.analysis_method = MultiSelectButton(t("Kõik"))
+        self.related = {}
+        related_host = QWidget()
+        related_layout = QHBoxLayout(related_host)
+        related_layout.setContentsMargins(0, 0, 0, 0)
+        for key, label in (
+            ("core", "Puursüdamik"),
+            ("samples", "Proovid"),
+            ("analyses", "Analüüsid"),
+        ):
+            choice = QComboBox()
+            choice.addItem(f"{t(label)}: {t('Kõik')}", "any")
+            choice.addItem(f"{t(label)}: {t('Jah')}", "yes")
+            choice.addItem(f"{t(label)}: {t('Ei')}", "no")
+            choice.setToolTip(t(label))
+            self.related[key] = choice
+            related_layout.addWidget(choice)
+        form.addRow(t("Seotud andmed"), related_host)
+        form.addRow(t("Proovi tüüp"), self.sample_type)
+        form.addRow(t("Proovi eesmärk"), self.sample_purpose)
+        form.addRow(t("Analüüsi meetod"), self.analysis_method)
+        layout.addLayout(form)
+        self.search_button = QPushButton(t("Otsi"))
+        self.search_button.clicked.connect(self.run)
+        layout.addWidget(self.search_button)
+        filter_actions = QWidget()
+        filter_actions_layout = QHBoxLayout(filter_actions)
+        filter_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.apply_filter_button = QPushButton(t("Rakenda filtrina"))
+        self.apply_filter_button.clicked.connect(self.apply_as_filter)
+        self.reset_button = QPushButton(t("Lähtesta"))
+        self.reset_button.clicked.connect(self.reset)
+        filter_actions_layout.addWidget(self.apply_filter_button)
+        filter_actions_layout.addWidget(self.reset_button)
+        layout.addWidget(filter_actions)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.results = QTableWidget(0, 6)
+        self.results.setHorizontalHeaderLabels(
+            (t("Allikas"), t("Tüüp"), t("Nimi"), t("ID"),
+             t("Sügavus"), t("Toiming"))
+        )
+        self.results.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        layout.addWidget(self.results)
+        self.source.currentIndexChanged.connect(self._source_changed)
+        self._source_changed()
+        self.reload_domain_options()
+
+    def _source_changed(self):
+        self.stratigraphic_index.setEnabled(
+            self.source.currentData() in {"all", "both", "egt"}
+        )
+
+    def reload_domain_options(self):
+        egt_types = self.plugin.egt_options(18, "proov_tyyp")
+        egt_purposes = self.plugin.egt_options(18, "eesmark")
+        self.sample_type.set_options(
+            [(f"egt:{code}", f"EGT · {name}") for code, name in egt_types]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_sample_type_options]
+        )
+        self.sample_purpose.set_options(
+            [(f"egt:{code}", f"EGT · {name}") for code, name in egt_purposes]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_purpose_options()]
+        )
+        self.analysis_method.set_options(
+            [(f"egt:{code}", f"EGT · {name}")
+             for code, name in self.plugin.egt_options(3, "analyys_meetod")]
+            + [(f"sarv:{code}", f"SARV · {name}")
+               for code, name in self.plugin.sarv_analysis_options]
+        )
+
+    def criteria(self):
+        def number(widget):
+            try:
+                return float(widget.text().strip()) if widget.text().strip() else None
+            except ValueError:
+                return None
+
+        return {
+            "source": self.source.currentData(),
+            "kinds": {
+                role for role, checkbox in self.kinds.items()
+                if checkbox.isChecked()
+            },
+            "text": self.text.text().strip(),
+            "current_extent": self.current_extent.isChecked(),
+            "depth_min": number(self.depth_min),
+            "depth_max": number(self.depth_max),
+            "stratigraphic_indices": (
+                self.stratigraphic_index.selected_values()
+                if self.stratigraphic_index.isEnabled() else set()
+            ),
+            "sample_type": self.sample_type.selected_values(),
+            "sample_purpose": self.sample_purpose.selected_values(),
+            "analysis_method": self.analysis_method.selected_values(),
+            "related": {
+                key: choice.currentData() for key, choice in self.related.items()
+            },
+        }
+
+    def run(self):
+        self._start_search(False)
+
+    def apply_as_filter(self):
+        self._start_search(True)
+
+    def _start_search(self, apply_filter):
+        self.search_button.setEnabled(False)
+        self.apply_filter_button.setEnabled(False)
+        self.status.setText(self.plugin.t("Otsitakse…"))
+        criteria = self.criteria()
+        if apply_filter:
+            criteria["_return_all"] = True
+            self.plugin.run_search(
+                criteria,
+                lambda rows, message="": self._set_filtered_results(
+                    rows, message, criteria
+                ),
+            )
+        else:
+            self.plugin.run_search(criteria, self.set_results)
+
+    def _set_filtered_results(self, rows, message, criteria):
+        self.set_results(rows[:500], message)
+        self.plugin.apply_search_filter(rows, criteria)
+        suffix = self.plugin.t("Otsingutulemused rakendati filtrina.")
+        self.status.setText(
+            f"{self.status.text()} {suffix}".strip()
+        )
+
+    def reset(self):
+        self.source.setCurrentIndex(self.source.findData("both"))
+        for checkbox in self.kinds.values():
+            checkbox.setChecked(True)
+        self.text.clear()
+        self.current_extent.setChecked(False)
+        self.depth_min.clear()
+        self.depth_max.clear()
+        self.stratigraphic_index.clear_selection()
+        self.sample_type.clear_selection()
+        self.sample_purpose.clear_selection()
+        self.analysis_method.clear_selection()
+        for choice in self.related.values():
+            choice.setCurrentIndex(0)
+        self.results.clearContents()
+        self.results.setRowCount(0)
+        self.status.clear()
+        self.search_button.setEnabled(True)
+        self.apply_filter_button.setEnabled(True)
+        self.plugin.clear_search_filter()
+
+    def set_results(self, rows, message=""):
+        self.search_button.setEnabled(True)
+        self.apply_filter_button.setEnabled(True)
+        self.status.setText(message or f"{len(rows)} {self.plugin.t('tulemust')}")
+        self.results.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column, key in enumerate(
+                ("source", "type", "name", "id", "depth")
+            ):
+                self.results.setItem(
+                    row_index, column,
+                    QTableWidgetItem(_display_value(row.get(key))),
+                )
+            button = QPushButton(self.plugin.t("Ava"))
+            button.clicked.connect(
+                lambda checked=False, item=row: self.plugin.open_search_result(item)
+            )
+            self.results.setCellWidget(row_index, 5, button)
+        self.results.resizeColumnsToContents()
 
 
 class _LegacyProfileWidget(QWidget):
@@ -624,6 +1708,8 @@ class ProfileWidget(QWidget):
     SARV_LANE_GAP = 2
     SARV_TRACK_WIDTH = SARV_LANES * SARV_LANE_WIDTH + (SARV_LANES - 1) * SARV_LANE_GAP
     SARV_CLUSTER_PIXELS = 12
+    VEKA_CONSTRUCTION_WIDTH = 110
+    VEKA_DRAW_WIDTH = 56
 
     def __init__(self, plugin):
         super().__init__()
@@ -636,11 +1722,14 @@ class ProfileWidget(QWidget):
         self.sarv_samples = []
         self.sarv_analyses = []
         self.sarv_specimens = []
+        self.veka_construction = []
+        self.veka_static_water_level = None
         self.core_images = {}
         self.sarv_core_images = {}
         self._click_targets = []
         self.total_depth = 0.0
         self.show_lithology = True
+        self.show_boundary_depths = True
         self.show_core_boxes = True
         self.show_sarv_core_boxes = True
         self.show_samples = True
@@ -648,18 +1737,21 @@ class ProfileWidget(QWidget):
         self.show_sarv_samples = True
         self.show_sarv_analyses = True
         self.show_sarv_specimens = True
+        self.show_veka_construction = False
+        self.show_veka_static_water_level = False
         self.group_sarv_overlaps = True
         self.core_applicable = False
         self.zoom_factor = 1.0
-        self.setMinimumWidth(720)
         self.setMouseTracking(True)
+        self._update_minimum_width()
         self._update_minimum_height()
 
     def sizeHint(self):
-        return QSize(900, self.minimumHeight())
+        return QSize(self.minimumWidth(), self.minimumHeight())
 
     def set_units(self, units):
         self.units = sorted(units, key=lambda item: _number(item.get("z_suht_ylemine")))
+        self._update_minimum_width()
         self._update_minimum_height()
 
     def set_core_boxes(self, rows):
@@ -690,6 +1782,33 @@ class ProfileWidget(QWidget):
         self.sarv_specimens = list(rows)
         self._update_minimum_height()
 
+    def set_veka_construction(self, rows):
+        prepared = []
+        seen = set()
+        for row in rows:
+            start = _number(row.get("alg"))
+            end = _number(row.get("lopp"))
+            category = self.plugin.veka_construction_category(
+                row.get("konstr_tyyp")
+            )
+            key = (category, start, end, _number(row.get("diam")))
+            if key in seen:
+                continue
+            seen.add(key)
+            prepared.append({
+                **row,
+                "_category": category,
+                "z_suht_ylemine": start,
+                "z_suht_alumine": end,
+            })
+        self.veka_construction = prepared
+        self._update_minimum_width()
+        self._update_minimum_height()
+
+    def set_veka_static_water_level(self, row):
+        self.veka_static_water_level = dict(row) if row else None
+        self.update()
+
     def set_core_images(self, images_by_core):
         self.core_images = {
             str(key).upper(): list(value) for key, value in images_by_core.items()
@@ -711,12 +1830,24 @@ class ProfileWidget(QWidget):
         self._update_minimum_height()
 
     def set_options(
-        self, lithology=None, core_boxes=None, samples=None, analyses=None,
-        sarv_core_boxes=None, sarv_samples=None, sarv_analyses=None, sarv_specimens=None,
+        self,
+        lithology=None,
+        boundary_depths=None,
+        core_boxes=None,
+        samples=None,
+        analyses=None,
+        sarv_core_boxes=None,
+        sarv_samples=None,
+        sarv_analyses=None,
+        sarv_specimens=None,
         sarv_grouping=None,
+        veka_construction=None,
+        veka_static_water_level=None,
     ):
         if lithology is not None:
             self.show_lithology = lithology
+        if boundary_depths is not None:
+            self.show_boundary_depths = boundary_depths
         if core_boxes is not None:
             self.show_core_boxes = core_boxes
         if sarv_core_boxes is not None:
@@ -733,7 +1864,88 @@ class ProfileWidget(QWidget):
             self.show_sarv_specimens = sarv_specimens
         if sarv_grouping is not None:
             self.group_sarv_overlaps = sarv_grouping
+        if veka_construction is not None:
+            self.show_veka_construction = veka_construction
+        if veka_static_water_level is not None:
+            self.show_veka_static_water_level = veka_static_water_level
+        self._update_minimum_width()
         self._update_minimum_height()
+
+    def _column_layout(self, metrics):
+        """Return compact column positions for the currently visible tracks."""
+        bar_left = 68
+        boundary_width = 64 if self.show_boundary_depths else 0
+        index_left = bar_left + self.BAR_WIDTH + boundary_width + 8
+        index_width = max(
+            76,
+            min(
+                140,
+                max(
+                    (
+                        metrics.horizontalAdvance(str(_unit_index(unit)))
+                        for unit in self.units
+                        if _unit_index(unit)
+                    ),
+                    default=66,
+                ) + 12,
+            ),
+        )
+        cursor = index_left + index_width
+        tracks = {}
+        for key, visible, width, gap in (
+            ("samples", self.show_samples, 11, 7),
+            ("analyses", self.show_analyses, 11, 9),
+            ("sarv_samples", self.show_sarv_samples, self.SARV_TRACK_WIDTH, 8),
+            ("sarv_analyses", self.show_sarv_analyses, self.SARV_TRACK_WIDTH, 8),
+            ("sarv_specimens", self.show_sarv_specimens, self.SARV_TRACK_WIDTH, 14),
+        ):
+            if not visible:
+                continue
+            tracks[key] = cursor
+            cursor += width + gap
+
+        construction_left = None
+        if self.show_veka_construction:
+            construction_left = cursor
+            cursor += self.VEKA_CONSTRUCTION_WIDTH + 14
+
+        lithology_left = cursor if tracks else cursor + 14
+        lithology_width = 0
+        if self.show_lithology:
+            lithology_width = max(
+                150,
+                min(
+                    320,
+                    max(
+                        (
+                            metrics.horizontalAdvance(str(
+                                unit.get("litoloogia")
+                                or unit.get("litoloogia_orig") or ""
+                            ))
+                            for unit in self.units
+                        ),
+                        default=138,
+                    ) + 12,
+                ),
+            )
+        content_right = (
+            lithology_left + lithology_width
+            if self.show_lithology else cursor
+        )
+        return {
+            "bar_left": bar_left,
+            "index_left": index_left,
+            "index_width": index_width,
+            "tracks": tracks,
+            "construction_left": construction_left,
+            "lithology_left": lithology_left,
+            "content_right": content_right,
+        }
+
+    def _update_minimum_width(self):
+        layout = self._column_layout(self.fontMetrics())
+        self.setMinimumWidth(max(360, round(layout["content_right"] + 20)))
+        self.updateGeometry()
 
     def wheelEvent(self, event):
         modifiers = event.modifiers()
@@ -768,7 +1980,12 @@ class ProfileWidget(QWidget):
             rows.extend(self.sarv_analyses)
         if self.show_sarv_specimens:
             rows.extend(self.sarv_specimens)
+        if self.show_veka_construction:
+            rows.extend(self.veka_construction)
         return rows
+
+    def _top_margin(self):
+        return 86 if self.show_veka_construction else self.TOP_MARGIN
 
     def _max_depth(self):
         rows = self._visible_intervals()
@@ -792,7 +2009,7 @@ class ProfileWidget(QWidget):
         self.setMinimumHeight(max(
             240,
             round(360 * self.zoom_factor),
-            round(self.TOP_MARGIN + content + self.BOTTOM_MARGIN),
+            round(self._top_margin() + content + self.BOTTOM_MARGIN),
         ))
         self.updateGeometry()
         self.update()
@@ -812,45 +2029,58 @@ class ProfileWidget(QWidget):
             return
 
         max_depth = max(1.0, self._max_depth())
+        top_margin = self._top_margin()
         draw_height = max(
             1.0,
             max_depth * self.BASE_PIXELS_PER_METER * self.zoom_factor,
-            self.height() - self.TOP_MARGIN - self.BOTTOM_MARGIN,
+            self.height() - top_margin - self.BOTTOM_MARGIN,
         )
-        bar_left = 68
-        sample_left = bar_left + self.BAR_WIDTH + 8
-        analysis_left = sample_left + 18
-        sarv_sample_left = analysis_left + 20
-        sarv_analysis_left = sarv_sample_left + self.SARV_TRACK_WIDTH + 8
-        sarv_specimen_left = sarv_analysis_left + self.SARV_TRACK_WIDTH + 8
-        label_left = sarv_specimen_left + self.SARV_TRACK_WIDTH + 14
+        layout = self._column_layout(painter.fontMetrics())
+        bar_left = layout["bar_left"]
+        index_left = layout["index_left"]
+        tracks = layout["tracks"]
+        construction_left = layout["construction_left"]
+        lithology_left = layout["lithology_left"]
 
         def depth_y(depth):
-            return self.TOP_MARGIN + draw_height * depth / max_depth
+            return top_margin + draw_height * depth / max_depth
 
+        heading_y = 66 if self.show_veka_construction else 34
+        painter.setPen(QColor("#555555"))
+        painter.drawText(index_left, heading_y, self.plugin.t("Indeks"))
+        if self.show_lithology:
+            painter.drawText(
+                lithology_left, heading_y, self.plugin.t("Litoloogia")
+            )
+        if self.show_veka_construction and construction_left is not None:
+            painter.drawText(
+                construction_left, heading_y,
+                self.plugin.t("Konstruktsioon"),
+            )
+            self._draw_veka_legend(painter, bar_left)
         painter.setPen(QColor("#355e3b"))
         if self.show_samples:
-            painter.drawText(sample_left - 1, 34, "P")
+            painter.drawText(tracks["samples"] - 1, heading_y, "P")
         painter.setPen(QColor("#7b3f8c"))
         if self.show_analyses:
-            painter.drawText(analysis_left - 1, 34, "A")
+            painter.drawText(tracks["analyses"] - 1, heading_y, "A")
         painter.setPen(QColor("#267d92"))
         if self.show_sarv_samples:
-            painter.drawText(sarv_sample_left + 14, 34, "SP")
+            painter.drawText(tracks["sarv_samples"] + 14, heading_y, "SP")
         painter.setPen(QColor("#c06b25"))
         if self.show_sarv_analyses:
-            painter.drawText(sarv_analysis_left + 14, 34, "SA")
+            painter.drawText(tracks["sarv_analyses"] + 14, heading_y, "SA")
         painter.setPen(QColor("#b23a62"))
         if self.show_sarv_specimens:
-            painter.drawText(sarv_specimen_left + 14, 34, "SE")
+            painter.drawText(tracks["sarv_specimens"] + 14, heading_y, "SE")
         painter.setPen(QColor("#555555"))
         if self.show_core_boxes:
             painter.drawText(bar_left, 20, self.plugin.t("Kastipiirid"))
 
         painter.setPen(QPen(QColor("#555555"), 1))
         painter.drawLine(
-            bar_left - 9, self.TOP_MARGIN,
-            bar_left - 9, round(self.TOP_MARGIN + draw_height),
+            bar_left - 9, top_margin,
+            bar_left - 9, round(top_margin + draw_height),
         )
         step = _nice_depth_step(max_depth, draw_height)
         depth = 0.0
@@ -860,6 +2090,7 @@ class ProfileWidget(QWidget):
             painter.drawText(2, y + 5, f"{depth:g} m")
             depth += step
 
+        unit_geometry = []
         for unit in self.units:
             start = _number(unit.get("z_suht_ylemine"))
             end = _number(unit.get("z_suht_alumine"))
@@ -869,12 +2100,39 @@ class ProfileWidget(QWidget):
             painter.fillRect(bar_left, round(y1), self.BAR_WIDTH, height, color)
             painter.setPen(QPen(QColor("#454545"), 1))
             painter.drawRect(bar_left, round(y1), self.BAR_WIDTH, height)
-            label = _unit_index(unit)
+            unit_geometry.append((unit, y1, height))
+
+        if self.show_boundary_depths:
+            guide_end = (
+                lithology_left - 6
+                if self.show_lithology
+                else layout["content_right"]
+            )
+            guide_pen = QPen(QColor(82, 91, 99, 62), 1)
+            painter.setPen(guide_pen)
+            for depth in self._unit_boundary_depths(max_depth):
+                y = round(depth_y(depth))
+                depth_text = f"{depth:g} m"
+                guide_start = (
+                    bar_left + self.BAR_WIDTH + 8
+                    + painter.fontMetrics().horizontalAdvance(depth_text) + 5
+                )
+                painter.drawLine(round(guide_start), y, round(guide_end), y)
+
+        for unit, y1, height in unit_geometry:
+            painter.setPen(QColor("#454545"))
+            index = _unit_index(unit)
             lithology = unit.get("litoloogia") or unit.get("litoloogia_orig") or ""
-            if self.show_lithology and lithology:
-                label = f"{label} · {lithology}" if label else str(lithology)
-            if label and height >= 8:
-                painter.drawText(label_left, round(y1) + 12, str(label))
+            if index and height >= 8:
+                painter.drawText(index_left, round(y1) + 12, str(index))
+            if self.show_lithology and lithology and height >= 8:
+                painter.drawText(lithology_left, round(y1) + 12, str(lithology))
+
+        if self.show_boundary_depths:
+            self._draw_boundary_depth_labels(
+                painter, depth_y, max_depth, bar_left, draw_height,
+                top_margin,
+            )
 
         if self.show_core_boxes and self.core_applicable:
             hatch_color = QColor("#4f5963")
@@ -889,7 +2147,7 @@ class ProfileWidget(QWidget):
                 )
             painter.setPen(QColor("#555555"))
             painter.drawText(
-                label_left, 34,
+                bar_left, 50,
                 self.plugin.t("Viirutus: puursüdamiku kast puudub"),
             )
 
@@ -946,29 +2204,232 @@ class ProfileWidget(QWidget):
 
         if self.show_samples:
             self._draw_intervals(
-                painter, self.samples, sample_left, QColor("#4f9b61"),
-                self.TOP_MARGIN, draw_height, max_depth,
+                painter, self.samples, tracks["samples"], QColor("#4f9b61"),
+                top_margin, draw_height, max_depth,
             )
         if self.show_analyses:
             self._draw_intervals(
-                painter, self.analyses, analysis_left, QColor("#8b4a9b"),
-                self.TOP_MARGIN, draw_height, max_depth,
+                painter, self.analyses, tracks["analyses"], QColor("#8b4a9b"),
+                top_margin, draw_height, max_depth,
             )
         if self.show_sarv_samples:
             self._draw_intervals(
-                painter, self.sarv_samples, sarv_sample_left, QColor("#267d92"),
-                self.TOP_MARGIN, draw_height, max_depth, sarv=True,
+                painter, self.sarv_samples, tracks["sarv_samples"], QColor("#267d92"),
+                top_margin, draw_height, max_depth, sarv=True,
             )
         if self.show_sarv_analyses:
             self._draw_intervals(
-                painter, self.sarv_analyses, sarv_analysis_left, QColor("#c06b25"),
-                self.TOP_MARGIN, draw_height, max_depth, sarv=True,
+                painter, self.sarv_analyses, tracks["sarv_analyses"], QColor("#c06b25"),
+                top_margin, draw_height, max_depth, sarv=True,
             )
         if self.show_sarv_specimens:
             self._draw_intervals(
-                painter, self.sarv_specimens, sarv_specimen_left, QColor("#b23a62"),
-                self.TOP_MARGIN, draw_height, max_depth, sarv=True,
+                painter, self.sarv_specimens, tracks["sarv_specimens"], QColor("#b23a62"),
+                top_margin, draw_height, max_depth, sarv=True,
             )
+        if self.show_veka_construction and construction_left is not None:
+            self._draw_veka_construction(
+                painter, construction_left, depth_y, max_depth,
+            )
+        if (
+            self.show_veka_static_water_level
+            and self.veka_static_water_level
+        ):
+            self._draw_veka_static_water_level(
+                painter, depth_y, max_depth, bar_left,
+                layout["content_right"],
+            )
+
+    def _draw_veka_legend(self, painter, left):
+        """Draw the compact legend used by the VEKA construction track."""
+        painter.save()
+        items = (
+            ("drill", self.plugin.t("Puuri diameeter")),
+            ("casing", self.plugin.t("Manteltoru")),
+            ("filter", self.plugin.t("Filter")),
+            ("open", self.plugin.t("Avatud / filtrita osa")),
+        )
+        x = left
+        for category, label in items:
+            self._draw_veka_swatch(painter, category, x, 10, 14, 11)
+            painter.setPen(QColor("#454545"))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawText(x + 19, 20, label)
+            x += painter.fontMetrics().horizontalAdvance(label) + 35
+        painter.setPen(QColor("#666666"))
+        painter.drawText(left, 40, self.plugin.t("Laius ja Ø näitavad diameetrit millimeetrites"))
+        painter.restore()
+
+    @staticmethod
+    def _draw_veka_swatch(painter, category, left, top, width, height):
+        if category == "drill":
+            painter.setPen(QPen(QColor("#737b82"), 1))
+            painter.setBrush(QColor(184, 191, 197, 115))
+            painter.drawRect(left, top, width, height)
+        elif category == "casing":
+            painter.setPen(QPen(QColor("#3f474d"), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(left + 2, top, left + 2, top + height)
+            painter.drawLine(left + width - 2, top, left + width - 2, top + height)
+        elif category == "filter":
+            painter.setPen(QPen(QColor("#237a9b"), 1))
+            painter.setBrush(QBrush(QColor("#7cc8df"), Qt.BrushStyle.BDiagPattern))
+            painter.drawRect(left, top, width, height)
+        else:
+            painter.setPen(QPen(
+                QColor("#d07a22"), 1.5, Qt.PenStyle.DashLine
+            ))
+            painter.setBrush(QColor(244, 172, 91, 45))
+            painter.drawRect(left, top, width, height)
+
+    def _draw_veka_construction(
+        self, painter, construction_left, depth_y, max_depth,
+    ):
+        rows = []
+        for row in self.veka_construction:
+            start = max(0.0, _number(row.get("z_suht_ylemine")))
+            end = min(max_depth, _number(row.get("z_suht_alumine")))
+            if end < start or start > max_depth:
+                continue
+            rows.append((row, start, end, _number(row.get("diam"))))
+        if not rows:
+            return
+        maximum_diameter = max(
+            (diameter for _, _, _, diameter in rows if diameter > 0),
+            default=1.0,
+        )
+        order = {"drill": 0, "open": 1, "casing": 2, "filter": 3}
+        rows.sort(key=lambda item: (
+            order.get(item[0].get("_category"), 4),
+            -item[3],
+            item[1],
+        ))
+        painter.save()
+        labels = []
+        for row, start, end, diameter in rows:
+            category = row.get("_category", "other")
+            if category == "other":
+                continue
+            width = (
+                max(10, round(self.VEKA_DRAW_WIDTH * diameter / maximum_diameter))
+                if diameter > 0 else 22
+            )
+            left = construction_left + round(
+                (self.VEKA_DRAW_WIDTH - width) / 2
+            )
+            y1, y2 = round(depth_y(start)), round(depth_y(end))
+            height = max(2, y2 - y1)
+            self._draw_veka_swatch(
+                painter, category, left, y1, width, height
+            )
+            if diameter > 0 and height >= 10:
+                labels.append({
+                    "target": y1,
+                    "right": left + width,
+                    "text": f"Ø{diameter:g}",
+                })
+        labels.sort(key=lambda item: item["target"])
+        positions = []
+        for item in labels:
+            target = item["target"] + 10
+            positions.append(
+                max(target, positions[-1] + 12) if positions else target
+            )
+        bottom = round(depth_y(max_depth)) + 4
+        if positions and positions[-1] > bottom:
+            positions[-1] = bottom
+            for index in range(len(positions) - 2, -1, -1):
+                positions[index] = min(
+                    positions[index], positions[index + 1] - 12
+                )
+        label_left = construction_left + self.VEKA_DRAW_WIDTH + 5
+        painter.setPen(QPen(QColor("#6a7075"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for item, label_y in zip(labels, positions):
+            painter.drawLine(
+                item["right"] + 1, item["target"],
+                label_left - 2, label_y - 4,
+            )
+            painter.drawText(label_left, label_y, item["text"])
+        painter.restore()
+
+    def _draw_veka_static_water_level(
+        self, painter, depth_y, max_depth, left, right,
+    ):
+        row = self.veka_static_water_level or {}
+        depth = _number(row.get("st_veetase"))
+        if depth < 0 or depth > max_depth:
+            return
+        y = round(depth_y(depth))
+        color = QColor("#1677b8")
+        painter.save()
+        painter.setPen(QPen(color, 1.6, Qt.PenStyle.DashDotLine))
+        painter.drawLine(left - 3, y, round(right), y)
+        date = str(row.get("katse_kp") or "")[:10]
+        text = f"{self.plugin.t('Staatiline veetase')}: {depth:g} m"
+        if date:
+            text += f" · {date}"
+        metrics = painter.fontMetrics()
+        text_x = left + self.BAR_WIDTH + 8
+        text_y = y - 4
+        painter.fillRect(
+            text_x - 3, text_y - metrics.ascent() - 2,
+            metrics.horizontalAdvance(text) + 6, metrics.height() + 3,
+            QColor(255, 255, 255, 225),
+        )
+        painter.setPen(color.darker(115))
+        painter.drawText(text_x, text_y, text)
+        painter.restore()
+
+    def _unit_boundary_depths(self, max_depth):
+        depths = []
+        for unit in self.units:
+            for key in ("z_suht_ylemine", "z_suht_alumine"):
+                raw = unit.get(key)
+                if raw in (None, ""):
+                    continue
+                depth = _number(raw)
+                if 0 <= depth <= max_depth:
+                    depths.append(round(depth, 4))
+        return sorted(set(depths))
+
+    def _draw_boundary_depth_labels(
+        self, painter, depth_y, max_depth, bar_left, draw_height, top_margin,
+    ):
+        depths = self._unit_boundary_depths(max_depth)
+        if not depths:
+            return
+
+        top = float(top_margin)
+        bottom = top + float(draw_height)
+        targets = [float(depth_y(depth)) for depth in depths]
+        if len(targets) == 1:
+            positions = targets
+        else:
+            gap = min(12.0, (bottom - top) / (len(targets) - 1))
+            positions = [max(top, targets[0])]
+            for target in targets[1:]:
+                positions.append(max(target, positions[-1] + gap))
+            if positions[-1] > bottom:
+                positions[-1] = bottom
+                for index in range(len(positions) - 2, -1, -1):
+                    positions[index] = min(positions[index], positions[index + 1] - gap)
+
+        old_font = painter.font()
+        label_font = painter.font()
+        label_font.setPixelSize(10)
+        painter.setFont(label_font)
+        painter.setPen(QPen(QColor("#4a4a4a"), 1))
+        bar_right = bar_left + self.BAR_WIDTH
+        text_left = bar_right + 8
+        for depth, target, position in zip(depths, targets, positions):
+            target_y = round(target)
+            label_y = round(position)
+            painter.drawLine(bar_right, target_y, bar_right + 4, target_y)
+            if abs(position - target) > 1:
+                painter.drawLine(bar_right + 4, target_y, bar_right + 6, label_y)
+            painter.drawText(text_left, label_y + 4, f"{depth:g} m")
+        painter.setFont(old_font)
 
     def _draw_intervals(
         self, painter, rows, left, color, top_margin, draw_height, max_depth,
@@ -1150,7 +2611,17 @@ class DetailWidget(QWidget):
         self.header = QLabel(t("Klõpsa kaardil puuraugul või vaatluspunktil."))
         self.header.setWordWrap(True)
         self.header.setStyleSheet("font-size: 15px; font-weight: 600; padding: 6px;")
-        layout.addWidget(self.header)
+        header_host = QWidget()
+        header_layout = QHBoxLayout(header_host)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.addWidget(self.header, 1)
+        self.add_to_cross_section = QCheckBox(t("Lisa läbilõikele"))
+        self.add_to_cross_section.setVisible(False)
+        self.add_to_cross_section.toggled.connect(
+            self._toggle_cross_section
+        )
+        header_layout.addWidget(self.add_to_cross_section)
+        layout.addWidget(header_host)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
@@ -1160,13 +2631,30 @@ class DetailWidget(QWidget):
         profile_page = QWidget()
         profile_layout = QVBoxLayout(profile_page)
         profile_controls = QHBoxLayout()
-        profile_controls.addWidget(QLabel("EGT:"))
+        self.profile_apply_filters = QCheckBox(t("Rakenda filtrid"))
+        self.profile_apply_filters.setChecked(False)
+        profile_controls.addWidget(self.profile_apply_filters)
+        profile_controls.addSpacing(12)
+        self.profile_egt_label = QLabel("EGT:")
+        profile_controls.addWidget(self.profile_egt_label)
+        self.profile_veka_construction = QCheckBox(t("Konstruktsioon"))
+        self.profile_veka_construction.setChecked(True)
+        self.profile_veka_construction.setVisible(False)
+        profile_controls.addWidget(self.profile_veka_construction)
+        self.profile_veka_static_water_level = QCheckBox(
+            t("Staatiline veetase")
+        )
+        self.profile_veka_static_water_level.setChecked(True)
+        self.profile_veka_static_water_level.setVisible(False)
+        profile_controls.addWidget(self.profile_veka_static_water_level)
         self.profile_lithology = QCheckBox(t("Litoloogia"))
+        self.profile_boundary_depths = QCheckBox(t("Piiride sügavused"))
         self.profile_boxes = QCheckBox(t("Kastipiirid"))
         self.profile_samples = QCheckBox(t("Proovid"))
         self.profile_analyses = QCheckBox(t("Analüüsid"))
         for checkbox in (
             self.profile_lithology,
+            self.profile_boundary_depths,
             self.profile_boxes,
             self.profile_samples,
             self.profile_analyses,
@@ -1176,7 +2664,8 @@ class DetailWidget(QWidget):
         profile_controls.addStretch(1)
         profile_layout.addLayout(profile_controls)
         sarv_controls = QHBoxLayout()
-        sarv_controls.addWidget(QLabel("SARV:"))
+        self.profile_sarv_label = QLabel("SARV:")
+        sarv_controls.addWidget(self.profile_sarv_label)
         self.profile_sarv_boxes = QCheckBox(t("Kastipiirid"))
         self.profile_sarv_samples = QCheckBox(t("Proovid"))
         self.profile_sarv_analyses = QCheckBox(t("Analüüsid"))
@@ -1198,8 +2687,24 @@ class DetailWidget(QWidget):
         profile_scroll.setWidget(self.profile)
         profile_layout.addWidget(profile_scroll)
         self.tabs.addTab(profile_page, t("Läbilõige"))
+        self.profile_apply_filters.toggled.connect(
+            self.refresh_profile_filters
+        )
         self.profile_lithology.toggled.connect(
             lambda checked: self.profile.set_options(lithology=checked)
+        )
+        self.profile_boundary_depths.toggled.connect(
+            lambda checked: self.profile.set_options(boundary_depths=checked)
+        )
+        self.profile_veka_construction.toggled.connect(
+            lambda checked: self.profile.set_options(
+                veka_construction=checked and self._veka_mode
+            )
+        )
+        self.profile_veka_static_water_level.toggled.connect(
+            lambda checked: self.profile.set_options(
+                veka_static_water_level=checked and self._veka_mode
+            )
         )
         self.profile_boxes.toggled.connect(
             lambda checked: self.profile.set_options(core_boxes=checked)
@@ -1229,8 +2734,34 @@ class DetailWidget(QWidget):
             (
                 t("Allikas"), t("Kast"), t("Ülemine"), t("Alumine"),
                 t("Diameeter"), t("Staatus / hoiukoht"), t("Pildid"),
+                t("Muudetud"),
             ),
             ("EGT", "SARV"),
+        )
+        core_edit_controls = QHBoxLayout()
+        self.core_edit_mode = QPushButton(t("Redigeerimisrežiim"))
+        self.core_edit_mode.setCheckable(True)
+        self.core_edit_mode.setStyleSheet(
+            "QPushButton:checked {"
+            " background-color: #8b5a2b; color: white; font-weight: 600;"
+            "}"
+        )
+        self.core_edit_mode.toggled.connect(self._set_core_edit_mode)
+        self.core_edit_button = QPushButton(t("Muuda valitud kasti…"))
+        self.core_edit_button.clicked.connect(self._edit_selected_core)
+        self.core_reset_button = QPushButton(t("Taasta algandmed"))
+        self.core_reset_button.clicked.connect(self._reset_selected_core)
+        self.core_edit_hint = QLabel(t(
+            "Muudatused salvestuvad ainult selles arvutis."
+        ))
+        self.core_edit_hint.setWordWrap(True)
+        core_edit_controls.addWidget(self.core_edit_mode)
+        core_edit_controls.addWidget(self.core_edit_button)
+        core_edit_controls.addWidget(self.core_reset_button)
+        core_edit_controls.addWidget(self.core_edit_hint, 1)
+        core_page.layout().insertLayout(1, core_edit_controls)
+        self.core.itemSelectionChanged.connect(
+            self._update_core_edit_actions
         )
         self.tabs.addTab(core_page, t("Puursüdamik"))
         samples_page, self.samples, self.sample_sources = self._source_page(
@@ -1251,7 +2782,9 @@ class DetailWidget(QWidget):
             ("SARV",),
         )
         self.tabs.addTab(specimens_page, t("Eksemplarid"))
-        self.attachments = self._table((t("Tüüp"), t("Fail"), t("Link")))
+        self.attachments = self._table(
+            (t("Tüüp"), t("Fail"), t("Link")), sortable=True,
+        )
         self.attachments.cellDoubleClicked.connect(self._open_attachment)
         self.tabs.addTab(self.attachments, t("Manused"))
         literature_page, self.literature, self.literature_sources = self._source_page(
@@ -1259,12 +2792,43 @@ class DetailWidget(QWidget):
             ("SARV",),
         )
         self.tabs.addTab(literature_page, t("Kirjandus"))
+        self.veka_construction = self._table((
+            t("Liik"), t("Tüüp"), t("Algus, m"), t("Lõpp, m"),
+            t("Diameeter, mm"), t("Ehitustooted"), t("Isolatsioon"),
+            t("Kirjeldus"),
+        ), sortable=True)
+        self.veka_construction_index = self.tabs.addTab(
+            self.veka_construction, t("Konstruktsioon")
+        )
+        self.veka_pumping = self._table((
+            t("Kuupäev"), t("Tüüp"), t("Veekompleks"), t("Sügavus, m"),
+            t("Staatiline veetase, m"), t("Dünaamiline veetase, m"),
+            t("Alandus, m"), t("Deebit, l/s"),
+            t("Eritootlikkus, l/(s·m)"), t("Kestus"), t("Tehnoloogia"),
+        ), sortable=True)
+        self.veka_pumping_index = self.tabs.addTab(
+            self.veka_pumping, t("Pumpamiskatsed")
+        )
+        self.veka_chemistry = self._table((
+            t("Analüüs"), t("Proovivõtu aeg"), t("Näitaja"),
+            t("Tulemus"), t("Ühik"),
+            t("Ühtlustatud tulemus"), t("Ühtlustatud ühik"),
+            t("Proovi liik"), t("Protokoll"),
+        ), sortable=True)
+        self.veka_chemistry_index = self.tabs.addTab(
+            self.veka_chemistry, t("Veekeemia")
+        )
+        self._veka_mode = False
+        self._last_standard_tab = 0
+        self._last_veka_tab = 0
         self._core_rows = []
         self._egt_core_images = {}
         self._sarv_core_rows = []
         self._sarv_core_images = {}
+        self._core_display_records = {}
         self._egt_samples = []
         self._sarv_samples = []
+        self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
         self._sarv_specimens = []
@@ -1272,6 +2836,10 @@ class DetailWidget(QWidget):
         self._sarv_analysis_refs = {"sample": [], "specimen": []}
         self._overview_has_sarv_id = False
         self._overview_sarv_locality_id = None
+        self._overview_base_rows = 0
+        self._current_detail_name = ""
+        self._current_detail_role = ""
+        self._current_detail_attributes = {}
         for checkbox in self.core_sources.values():
             checkbox.toggled.connect(self._refresh_core)
         for checkbox in self.sample_sources.values():
@@ -1282,15 +2850,23 @@ class DetailWidget(QWidget):
             checkbox.toggled.connect(self._refresh_specimens)
         for checkbox in self.literature_sources.values():
             checkbox.toggled.connect(self._refresh_literature)
+        self._update_core_edit_actions()
+        self._set_veka_mode(False)
 
     @staticmethod
-    def _table(headers):
+    def _table(headers, sortable=False):
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setAlternatingRowColors(True)
         table.horizontalHeader().setStretchLastSection(True)
+        if sortable:
+            # Keep the source order until the user actually clicks a header.
+            table.horizontalHeader().setSortIndicator(
+                -1, Qt.SortOrder.AscendingOrder
+            )
+            table.setSortingEnabled(True)
         return table
 
     @classmethod
@@ -1306,18 +2882,116 @@ class DetailWidget(QWidget):
             controls.addWidget(checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
-        table = cls._table(headers)
+        table = cls._table(headers, sortable=True)
         layout.addWidget(table)
         return page, table, checks
 
+    def _set_veka_mode(self, enabled):
+        """Show only data tabs that are meaningful for the active source."""
+        enabled = bool(enabled)
+        current = self.tabs.currentIndex()
+        mode_changed = enabled != self._veka_mode
+        if mode_changed:
+            if self._veka_mode:
+                self._last_veka_tab = current
+            else:
+                self._last_standard_tab = current
+        standard_indices = range(2, 8)
+        veka_indices = (
+            self.veka_construction_index,
+            self.veka_pumping_index,
+            self.veka_chemistry_index,
+        )
+        for index in standard_indices:
+            self.tabs.setTabVisible(index, not enabled)
+        for index in veka_indices:
+            self.tabs.setTabVisible(index, enabled)
+        self.profile_egt_label.setText("VEKA:" if enabled else "EGT:")
+        self.profile_veka_construction.setVisible(enabled)
+        self.profile_veka_static_water_level.setVisible(enabled)
+        self.profile_apply_filters.setVisible(not enabled)
+        for widget in (
+            self.profile_boxes, self.profile_samples, self.profile_analyses,
+            self.profile_sarv_label, self.profile_sarv_boxes,
+            self.profile_sarv_samples, self.profile_sarv_analyses,
+            self.profile_sarv_specimens, self.profile_sarv_grouping,
+        ):
+            widget.setVisible(not enabled)
+        self.profile.set_options(
+            core_boxes=(
+                False if enabled else self.profile_boxes.isChecked()
+            ),
+            sarv_core_boxes=(
+                False if enabled else self.profile_sarv_boxes.isChecked()
+            ),
+            samples=(
+                False if enabled else self.profile_samples.isChecked()
+            ),
+            analyses=(
+                False if enabled else self.profile_analyses.isChecked()
+            ),
+            sarv_samples=(
+                False if enabled else self.profile_sarv_samples.isChecked()
+            ),
+            sarv_analyses=(
+                False if enabled else self.profile_sarv_analyses.isChecked()
+            ),
+            sarv_specimens=(
+                False if enabled else self.profile_sarv_specimens.isChecked()
+            ),
+            veka_construction=(
+                enabled and self.profile_veka_construction.isChecked()
+            ),
+            veka_static_water_level=(
+                enabled and self.profile_veka_static_water_level.isChecked()
+            ),
+        )
+        self._veka_mode = enabled
+        if not mode_changed:
+            target = current
+        elif enabled:
+            target = current if current in {0, 1} else self._last_veka_tab
+            if target not in {0, 1, *veka_indices}:
+                target = 0
+        else:
+            target = current if current in {0, 1} else self._last_standard_tab
+            if target not in set(range(0, 8)):
+                target = 0
+        self.tabs.setCurrentIndex(target)
+
     def show_loading(self, name, attributes, role):
+        self._current_detail_name = str(name)
+        self._current_detail_role = str(role)
+        self._current_detail_attributes = dict(attributes or {})
+        supported = role in {
+            "boreholes", "observations", "veka_boreholes",
+            "sarv_drillcores",
+        }
+        key = self.current_cross_section_key()
+        self.add_to_cross_section.blockSignals(True)
+        self.add_to_cross_section.setVisible(supported)
+        self.add_to_cross_section.setChecked(
+            bool(
+                supported and key
+                and self.plugin.cross_section_contains(key)
+            )
+        )
+        self.add_to_cross_section.blockSignals(False)
+        self._set_veka_mode(role == "veka_boreholes")
         self.header.setText(f"{name} — {self.plugin.t('seotud andmeid laaditakse…')}")
-        self._overview_has_sarv_id = bool(str(attributes.get("sarv_id") or "").strip())
+        sarv_id = str(attributes.get("sarv_id") or "").strip()
+        self._overview_has_sarv_id = (
+            sarv_id.isdigit() and int(sarv_id) > 0
+        )
         self._overview_sarv_locality_id = None
         self._fill_pairs(self.overview, attributes, role)
-        self.profile.set_core_applicable(role == "boreholes")
+        self._overview_base_rows = self.overview.rowCount()
+        self.profile.set_core_applicable(
+            role in {"boreholes", "sarv_drillcores"}
+        )
         self.profile.set_total_depth(
             attributes.get("pikkus") or attributes.get("vertikaalne_ulatus")
+            or attributes.get("depth") or attributes.get("sygavus")
         )
         self.profile.set_units([])
         self.profile.set_core_boxes([])
@@ -1329,12 +3003,15 @@ class DetailWidget(QWidget):
         self.profile.set_sarv_samples([])
         self.profile.set_sarv_analyses([])
         self.profile.set_sarv_specimens([])
+        self.profile.set_veka_construction([])
+        self.profile.set_veka_static_water_level(None)
         self._core_rows = []
         self._egt_core_images = {}
         self._sarv_core_rows = []
         self._sarv_core_images = {}
         self._egt_samples = []
         self._sarv_samples = []
+        self._sarv_samples_by_source = {"locality": [], "site": []}
         self._egt_analyses = ([], {})
         self._sarv_analyses_by_source = {"sample": [], "specimen": []}
         self._sarv_specimens = []
@@ -1342,7 +3019,8 @@ class DetailWidget(QWidget):
         self._sarv_analysis_refs = {"sample": [], "specimen": []}
         for table in (
             self.core, self.samples, self.analyses, self.specimens,
-            self.attachments, self.literature,
+            self.attachments, self.literature, self.veka_construction,
+            self.veka_pumping, self.veka_chemistry,
         ):
             table.setRowCount(0)
         for index, title in enumerate(
@@ -1352,6 +3030,89 @@ class DetailWidget(QWidget):
             ), start=1
         ):
             self.tabs.setTabText(index, f"{self.plugin.t(title)} (…)")
+        for index, title in (
+            (self.veka_construction_index, "Konstruktsioon"),
+            (self.veka_pumping_index, "Pumpamiskatsed"),
+            (self.veka_chemistry_index, "Veekeemia"),
+        ):
+            self.tabs.setTabText(index, f"{self.plugin.t(title)} (…)")
+
+    def current_cross_section_key(self):
+        attributes = self._current_detail_attributes
+        identifier = next((
+            attributes.get(key) for key in (
+                "esri_globalid", "globalid", "eelis_id", "sarv_id",
+                "gea_id", "kkr_kood", "number",
+            ) if attributes.get(key) not in (None, "")
+        ), "")
+        return (
+            f"{self._current_detail_role}:{identifier}"
+            if identifier else ""
+        )
+
+    def cross_section_snapshot(self):
+        key = self.current_cross_section_key()
+        if not key:
+            return None
+        attributes = self._current_detail_attributes
+
+        def optional_number(*keys):
+            for name in keys:
+                value = attributes.get(name)
+                if value not in (None, "", "NULL", "<NULL>"):
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        source = {
+            "boreholes": "EGT PA",
+            "observations": "EGT VP",
+            "veka_boreholes": "VEKA",
+            "sarv_drillcores": "SARV",
+        }.get(self._current_detail_role, self._current_detail_role)
+        return {
+            "key": key,
+            "role": self._current_detail_role,
+            "source": source,
+            "id": key.split(":", 1)[-1],
+            "name": self._current_detail_name,
+            "x": optional_number("_qeoloog_x_3301", "kesk_x"),
+            "y": optional_number("_qeoloog_y_3301", "kesk_y"),
+            "elevation": optional_number(
+                "z_abs", "elevation", "altitude", "height"
+            ),
+            "elevation_source": (
+                "z_abs" if attributes.get("z_abs") not in (None, "")
+                else "SARV" if self._current_detail_role.startswith("sarv_")
+                else ""
+            ),
+            "depth": self.profile.total_depth,
+            "units": self.profile.units,
+            "core_boxes": self.profile.core_boxes,
+            "sarv_core_boxes": self.profile.sarv_core_boxes,
+            "samples": self.profile.samples,
+            "analyses": self.profile.analyses,
+            "sarv_samples": self.profile.sarv_samples,
+            "sarv_analyses": self.profile.sarv_analyses,
+            "sarv_specimens": self.profile.sarv_specimens,
+            "veka_construction": self.profile.veka_construction,
+            "static_water": self.profile.veka_static_water_level,
+        }
+
+    def _toggle_cross_section(self, checked):
+        key = self.current_cross_section_key()
+        if not key:
+            return
+        if checked:
+            self.plugin.add_current_detail_to_cross_section()
+        else:
+            self.plugin.remove_cross_section_item(key)
+
+    def _notify_cross_section_update(self):
+        if self.add_to_cross_section.isChecked():
+            self.plugin.add_current_detail_to_cross_section()
 
     def set_ready(self, name):
         self.header.setText(name)
@@ -1376,14 +3137,269 @@ class DetailWidget(QWidget):
         )
         self.overview.resizeColumnsToContents()
 
+    def add_match_candidates(
+        self, label, candidates, open_callback=None,
+        confirm_callback=None, remove_callback=None, edit_callback=None,
+    ):
+        for candidate in candidates:
+            row = self.overview.rowCount()
+            self.overview.insertRow(row)
+            self.overview.setItem(row, 0, QTableWidgetItem(self.plugin.t(label)))
+            host = QWidget()
+            layout = QHBoxLayout(host)
+            layout.setContentsMargins(4, 0, 4, 0)
+            text = html_escape(str(candidate.get("text") or candidate.get("id") or ""))
+            url = html_escape(str(candidate.get("url") or ""))
+            value = QLabel(f'<a href="{url}">{text}</a>' if url else text)
+            value.setOpenExternalLinks(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            layout.addWidget(value)
+            evidence = candidate.get("evidence")
+            if evidence:
+                evidence_label = QLabel(str(evidence))
+                evidence_label.setStyleSheet("color: #666666;")
+                layout.addWidget(evidence_label)
+            if open_callback:
+                button = QPushButton(self.plugin.t("Ava rakenduses"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: open_callback(item)
+                )
+                layout.addWidget(button)
+            if edit_callback:
+                button = QPushButton(self.plugin.t("Muuda SARV seost"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: edit_callback(item)
+                )
+                layout.addWidget(button)
+            if confirm_callback and not candidate.get("confirmed"):
+                button = QPushButton(self.plugin.t("Kinnita vaste"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: confirm_callback(item)
+                )
+                layout.addWidget(button)
+            if remove_callback and candidate.get("manual"):
+                button = QPushButton(self.plugin.t("Eemalda vaste"))
+                button.clicked.connect(
+                    lambda checked=False, item=candidate: remove_callback(item)
+                )
+                layout.addWidget(button)
+            layout.addStretch(1)
+            self.overview.setCellWidget(row, 1, host)
+        self.overview.resizeColumnsToContents()
+
+    def reset_match_rows(self):
+        """Remove inferred/match rows while retaining source attributes."""
+        self.overview.setRowCount(self._overview_base_rows)
+
+    def add_sarv_match_editor(
+        self, current_type, current_id, manual, edit_callback,
+        reset_callback=None, source_sarv_id="", source_ma_id="",
+        invalid_sarv_id=False, invalid_ma_id=False,
+        invalid_callback=None,
+    ):
+        row = self.overview.rowCount()
+        self.overview.insertRow(row)
+        self.overview.setItem(
+            row, 0, QTableWidgetItem(self.plugin.t("SARV seose haldus")),
+        )
+        host = QWidget()
+        layout = QHBoxLayout(host)
+        layout.setContentsMargins(4, 0, 4, 0)
+        if current_id:
+            prefix = (
+                self.plugin.t("Kohalik parandus")
+                if manual else self.plugin.t("GEA SARV ID")
+            )
+            type_label = self.plugin.t({
+                "locality": "lokaliteet",
+                "site": "uuringupunkt",
+            }.get(current_type, "puursüdamik"))
+            layout.addWidget(
+                QLabel(f"{prefix}: {type_label} {current_id}"),
+            )
+        else:
+            layout.addWidget(QLabel(self.plugin.t("SARV objekt pole seotud")))
+
+        def ask_for_id():
+            object_types = (
+                (self.plugin.t("puursüdamik"), "drillcore"),
+                (self.plugin.t("lokaliteet"), "locality"),
+                (self.plugin.t("uuringupunkt"), "site"),
+            )
+            labels = [label for label, value in object_types]
+            initial_type = next((
+                index for index, (_, value) in enumerate(object_types)
+                if value == current_type
+            ), 0)
+            type_label, accepted = QInputDialog.getItem(
+                self,
+                self.plugin.t("Määra SARV seos"),
+                self.plugin.t("SARV objekti tüüp"),
+                labels, initial_type, False,
+            )
+            if not accepted:
+                return
+            source_type = next(
+                value for label, value in object_types
+                if label == type_label
+            )
+            try:
+                initial = max(1, int(current_id or 1))
+            except (TypeError, ValueError):
+                initial = 1
+            value, accepted = QInputDialog.getInt(
+                self,
+                self.plugin.t("Määra SARV seos"),
+                self.plugin.t("SARV objekti ID"),
+                initial, 1, 2147483647, 1,
+            )
+            if accepted:
+                edit_callback(source_type, value)
+
+        button = QPushButton(
+            self.plugin.t("Muuda SARV seost")
+            if current_id else self.plugin.t("Lisa SARV seos")
+        )
+        button.clicked.connect(ask_for_id)
+        layout.addWidget(button)
+        if manual and reset_callback:
+            button = QPushButton(self.plugin.t("Taasta GEA seos"))
+            button.clicked.connect(reset_callback)
+            layout.addWidget(button)
+        if source_sarv_id not in (None, ""):
+            invalid_sarv = QCheckBox(
+                f"{self.plugin.t('Vigane GEA sarv_id seos')}: "
+                f"{source_sarv_id}"
+            )
+            invalid_sarv.setChecked(bool(invalid_sarv_id))
+            if invalid_callback:
+                invalid_sarv.toggled.connect(
+                    lambda checked: invalid_callback(
+                        "invalid_sarv_id", checked
+                    )
+                )
+            layout.addWidget(invalid_sarv)
+        if source_ma_id not in (None, ""):
+            invalid_ma = QCheckBox(
+                f"{self.plugin.t('Vigane Maa-ameti ID seos')}: "
+                f"{source_ma_id}"
+            )
+            invalid_ma.setChecked(bool(invalid_ma_id))
+            if invalid_callback:
+                invalid_ma.toggled.connect(
+                    lambda checked: invalid_callback(
+                        "invalid_ma_id", checked
+                    )
+                )
+            layout.addWidget(invalid_ma)
+        layout.addStretch(1)
+        self.overview.setCellWidget(row, 1, host)
+        self.overview.resizeColumnsToContents()
+
     def set_profile(self, units):
         self.profile.set_units(units)
         self.tabs.setTabText(1, f"{self.plugin.t('Läbilõige')} ({len(units)})")
+        self._notify_cross_section_update()
+
+    def set_veka_construction(self, rows):
+        self.profile.set_veka_construction(rows)
+        values = []
+        for row in rows:
+            code = str(row.get("konstr_tyyp") or "")
+            category = self.plugin.t({
+                "filter": "Filter",
+                "casing": "Manteltoru / toru",
+                "open": "Avatud / filtrita osa",
+                "drill": "Puuri diameeter",
+                "other": "Muu",
+            }[self.plugin.veka_construction_category(code)])
+            values.append((
+                category,
+                row.get("konstr_tyyp_selg") or code,
+                row.get("alg"), row.get("lopp"), row.get("diam"),
+                row.get("tx_ehitustooted"),
+                row.get("tx_manteltoru_isolats"), row.get("tx_kirjeldus"),
+            ))
+        self._fill_rows(self.veka_construction, values)
+        self.tabs.setTabText(
+            self.veka_construction_index,
+            f"{self.plugin.t('Konstruktsioon')} ({len(values)})",
+        )
+        self._notify_cross_section_update()
+
+    def set_veka_pumping_tests(self, rows):
+        self.profile.set_veka_static_water_level(
+            self.plugin.veka_static_water_level(rows)
+        )
+        values = [(
+            row.get("katse_kp"),
+            row.get("puurauk_param_tyyp_selg")
+            or row.get("puurauk_param_tyyp"),
+            row.get("veekompleks_selg") or row.get("veekompleks"),
+            row.get("sygavus"), row.get("st_veetase"),
+            row.get("dyn_veetase"), row.get("alandus"), row.get("deebit"),
+            self.plugin.veka_specific_capacity(row), row.get("kestus"),
+            row.get("tx_tehnoloogia"),
+        ) for row in rows]
+        self._fill_rows(self.veka_pumping, values)
+        self.tabs.setTabText(
+            self.veka_pumping_index,
+            f"{self.plugin.t('Pumpamiskatsed')} ({len(values)})",
+        )
+        self._notify_cross_section_update()
+
+    def set_veka_chemistry(self, rows):
+        values = []
+        for row in rows:
+            normalized_value, normalized_unit = self.plugin.veka_analysis_result(
+                row
+            )
+            values.append((
+                row.get("analyys_number"), row.get("proov_algus"),
+                row.get("naitaja_nimi") or row.get("naitaja_kood"),
+                row.get("naitaja_tulem"),
+                row.get("naitaja_yhik"), normalized_value, normalized_unit,
+                row.get("proov_liik"),
+                _link_cell(
+                    row.get("_protocol_label") or self.plugin.t("Ava"),
+                    row.get("_protocol_url"),
+                ) if row.get("_protocol_url") else "",
+            ))
+        self._fill_rows(self.veka_chemistry, values)
+        title = (
+            f"{self.plugin.t('Veekeemia')} ({len(values)})"
+            if values else self.plugin.t("Veekeemia (andmed puuduvad)")
+        )
+        self.tabs.setTabText(self.veka_chemistry_index, title)
+
+    def set_veka_overview_fields(self, values):
+        """Add or update selected VEKA detail fields in the overview."""
+        for key, value in values.items():
+            if value in (None, ""):
+                continue
+            label = field_label(str(key), self.plugin.language)
+            target_row = None
+            for row in range(self.overview.rowCount()):
+                item = self.overview.item(row, 0)
+                if item and item.text() == label:
+                    target_row = row
+                    break
+            if target_row is None:
+                target_row = self.overview.rowCount()
+                self.overview.insertRow(target_row)
+                self.overview.setItem(
+                    target_row, 0, QTableWidgetItem(label)
+                )
+            self.overview.setItem(
+                target_row, 1, QTableWidgetItem(_display_value(value))
+            )
+        self._overview_base_rows = self.overview.rowCount()
+        self.overview.resizeColumnsToContents()
 
     def set_core(self, rows):
         self._core_rows = list(rows)
-        self.profile.set_core_boxes(rows)
         self._refresh_core()
+        self._notify_cross_section_update()
 
     def set_core_images(self, attachments):
         images_by_core = {}
@@ -1399,11 +3415,8 @@ class DetailWidget(QWidget):
 
     def set_sarv_core(self, rows):
         self._sarv_core_rows = list(rows)
-        self.profile.set_sarv_core_boxes([
-            track for row in rows
-            if (track := _sarv_core_track(row)) is not None
-        ])
         self._refresh_core()
+        self._notify_cross_section_update()
 
     def set_sarv_core_images(self, attachments):
         by_filename = {}
@@ -1431,33 +3444,84 @@ class DetailWidget(QWidget):
     def _refresh_core(self):
         entries = []
         values = []
-        if self.core_sources["EGT"].isChecked():
-            for row in self._core_rows:
-                urls = self._egt_core_images.get(
-                    str(row.get("globalid") or "").upper(), []
+        self._core_display_records = {}
+        corrected_egt = [
+            (
+                row,
+                self.plugin.corrected_core_box("EGT", row),
+            )
+            for row in self._core_rows
+        ]
+        prepared_sarv = []
+        for row in self._sarv_core_rows:
+            source_row = dict(row)
+            source_row["_qeoloog_status"] = (
+                _nested_text(row.get("storage"), self.plugin.language)
+                or _nested_text(row.get("location"), self.plugin.language)
+                or _nested_text(
+                    row.get("_drillcore_storage"), self.plugin.language
                 )
+                or row.get("_drillcore_name")
+            )
+            prepared_sarv.append((
+                source_row,
+                self.plugin.corrected_core_box("SARV", source_row),
+            ))
+        self.profile.set_core_boxes([
+            corrected for _, corrected in corrected_egt
+        ])
+        self.profile.set_sarv_core_boxes([
+            track for _, corrected in prepared_sarv
+            if (track := _sarv_core_track(corrected)) is not None
+        ])
+        if self.core_sources["EGT"].isChecked():
+            for source_row, row in corrected_egt:
+                urls = self._egt_core_images.get(
+                    str(source_row.get("globalid") or "").upper(), []
+                )
+                key = core_correction_key("EGT", source_row)
+                correction = self.plugin.core_corrections.get(key, {})
+                self._core_display_records[key] = {
+                    "source": "EGT",
+                    "raw": source_row,
+                    "corrected": row,
+                }
                 entries.append(urls)
                 values.append((
                     "EGT", row.get("kast_nr"), row.get("z_suht_ylemine"),
                     row.get("z_suht_alumine"), row.get("diameeter"),
                     row.get("staatus"), "",
+                    str(correction.get("updated_at") or "")[:19],
                 ))
         if self.core_sources["SARV"].isChecked():
-            for row in self._sarv_core_rows:
-                urls = self._sarv_core_images.get(str(row.get("id")), [])
-                storage = (
-                    _nested_text(row.get("storage"), self.plugin.language)
-                    or _nested_text(row.get("location"), self.plugin.language)
-                    or _nested_text(row.get("_drillcore_storage"), self.plugin.language)
-                    or row.get("_drillcore_name")
+            for source_row, row in prepared_sarv:
+                urls = self._sarv_core_images.get(
+                    str(source_row.get("id")), []
                 )
+                key = core_correction_key("SARV", source_row)
+                correction = self.plugin.core_corrections.get(key, {})
+                self._core_display_records[key] = {
+                    "source": "SARV",
+                    "raw": source_row,
+                    "corrected": row,
+                }
                 entries.append(urls)
                 values.append((
                     "SARV", row.get("number"), row.get("depth_start"),
-                    row.get("depth_end"), row.get("diameter"), storage, "",
+                    row.get("depth_end"), row.get("diameter"),
+                    row.get("_qeoloog_status"), "",
+                    str(correction.get("updated_at") or "")[:19],
                 ))
-        self._fill_rows(self.core, values)
-        for row_index, urls in enumerate(entries):
+        sorting_state = self._fill_rows(
+            self.core, values, restore_sorting=False
+        )
+        for row_index, (key, record) in enumerate(
+            self._core_display_records.items()
+        ):
+            item = self.core.item(row_index, 0)
+            if item:
+                item.setData(Qt.ItemDataRole.UserRole, key)
+            urls = entries[row_index]
             if not urls:
                 continue
             anchors = " · ".join(
@@ -1470,25 +3534,113 @@ class DetailWidget(QWidget):
             label.setContentsMargins(4, 0, 4, 0)
             label.setToolTip(self.plugin.t("Ava puursüdamiku kasti pilt"))
             self.core.setCellWidget(row_index, 6, label)
+        self._restore_table_sorting(self.core, sorting_state)
         self.tabs.setTabText(
             2,
             f"{self.plugin.t('Puursüdamik')} "
             f"({len(self._core_rows) + len(self._sarv_core_rows)})",
         )
         self.core.resizeColumnsToContents()
+        self._update_core_edit_actions()
+
+    def _selected_core_record(self):
+        row = self.core.currentRow()
+        item = self.core.item(row, 0) if row >= 0 else None
+        key = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        return self._core_display_records.get(str(key or ""))
+
+    def _set_core_edit_mode(self, enabled):
+        self.core_edit_hint.setText(
+            self.plugin.t(
+                "Vali kast ja vajuta „Muuda valitud kasti…“."
+                if enabled else
+                "Muudatused salvestuvad ainult selles arvutis."
+            )
+        )
+        self._update_core_edit_actions()
+
+    def _update_core_edit_actions(self):
+        if not hasattr(self, "core_edit_mode"):
+            return
+        record = self._selected_core_record()
+        enabled = self.core_edit_mode.isChecked() and record is not None
+        self.core_edit_button.setEnabled(enabled)
+        key = (
+            core_correction_key(record["source"], record["raw"])
+            if record else ""
+        )
+        self.core_reset_button.setEnabled(
+            bool(enabled and key in self.plugin.core_corrections)
+        )
+
+    def _edit_selected_core(self):
+        record = self._selected_core_record()
+        if not self.core_edit_mode.isChecked() or not record:
+            return
+        key = core_correction_key(record["source"], record["raw"])
+        if not key:
+            QMessageBox.warning(
+                self, self.plugin.t("Kohalik redigeerimine"),
+                self.plugin.t(
+                    "Sellel kastil puudub püsiv kirje ID ja seda ei saa "
+                    "turvaliselt salvestada."
+                ),
+            )
+            return
+        dialog = CoreCorrectionDialog(
+            self.plugin, record["source"], key.split(":", 1)[-1],
+            core_values(record["source"], record["corrected"]), self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.plugin.save_core_box_correction(
+            record["source"], record["raw"], dialog.values(), {
+                "parent_role": self._current_detail_role,
+                "parent_id": self.current_cross_section_key(),
+                "parent_name": self._current_detail_name,
+            },
+        )
+        self._refresh_core()
+        self._notify_cross_section_update()
+
+    def _reset_selected_core(self):
+        record = self._selected_core_record()
+        if not self.core_edit_mode.isChecked() or not record:
+            return
+        if QMessageBox.question(
+            self, self.plugin.t("Taasta algandmed"),
+            self.plugin.t(
+                "Kas eemaldada selle kasti kohalikud parandused?"
+            ),
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        if self.plugin.reset_core_box_correction(
+            record["source"], record["raw"]
+        ):
+            self._refresh_core()
+            self._notify_cross_section_update()
 
     def set_samples(self, rows):
         self._egt_samples = list(rows)
-        self.profile.set_samples(rows)
+        self.refresh_profile_filters()
         self._refresh_samples()
+        self._notify_cross_section_update()
 
-    def set_sarv_samples(self, rows):
-        self._sarv_samples = list(rows)
-        self.profile.set_sarv_samples([
-            track for row in rows
-            if (track := _sarv_track(row, "sample")) is not None
-        ])
+    def set_sarv_samples(self, rows, source="locality"):
+        self._sarv_samples_by_source[source] = list(rows)
+        unique = {}
+        anonymous = []
+        for values in self._sarv_samples_by_source.values():
+            for row in values:
+                row_id = row.get("id") if isinstance(row, dict) else None
+                if row_id in (None, ""):
+                    anonymous.append(row)
+                else:
+                    unique[str(row_id)] = row
+        self._sarv_samples = list(unique.values()) + anonymous
+        self.refresh_profile_filters()
         self._refresh_samples()
+        self._notify_cross_section_update()
 
     def _refresh_samples(self):
         values = []
@@ -1497,11 +3649,11 @@ class DetailWidget(QWidget):
                 (
                     "EGT",
                     row.get("proov_tahis_alg"),
-                    row.get("proov_tyyp"),
+                    self.plugin.decode_egt(18, "proov_tyyp", row.get("proov_tyyp")),
                     row.get("z_suht_ylemine"),
                     row.get("z_suht_alumine"),
-                    row.get("eesmark"),
-                    row.get("staatus"),
+                    self.plugin.decode_egt(18, "eesmark", row.get("eesmark")),
+                    self.plugin.decode_egt(18, "staatus", row.get("staatus")),
                 )
                 for row in self._egt_samples
             )
@@ -1523,26 +3675,26 @@ class DetailWidget(QWidget):
             )
         self._fill_rows(self.samples, values)
         self.tabs.setTabText(
-            3, f"{self.plugin.t('Proovid')} ({len(self._egt_samples) + len(self._sarv_samples)})"
+            3,
+            f"{self.plugin.t('Proovid')} "
+            f"({len(self._egt_samples) + len(self._sarv_samples)})",
         )
 
     def set_analyses(self, rows, results_by_analysis=None):
         self._egt_analyses = (list(rows), results_by_analysis or {})
-        self.profile.set_analyses(rows)
+        self.refresh_profile_filters()
         self._refresh_analyses()
+        self._notify_cross_section_update()
 
     def set_sarv_analyses(self, source, rows):
         self._sarv_analyses_by_source[source] = list(rows)
-        all_rows = sum(self._sarv_analyses_by_source.values(), [])
-        self.profile.set_sarv_analyses([
-            track for row in all_rows
-            if (track := _sarv_analysis_track(row)) is not None
-        ])
+        self.refresh_profile_filters()
         self._sarv_analysis_refs[source] = [
             {"reference": row.get("reference")} for row in rows if row.get("reference")
         ]
         self._refresh_analyses()
         self._refresh_literature()
+        self._notify_cross_section_update()
 
     def _refresh_analyses(self):
         values = []
@@ -1551,12 +3703,18 @@ class DetailWidget(QWidget):
             for row in egt_rows:
                 results = results_by_analysis.get(row.get("globalid"), [])
                 indicators = ", ".join(
-                    _analysis_result(item, self.plugin.t("Näitaja")) for item in results[:8]
+                    _analysis_result(
+                        item, self.plugin.t("Näitaja"), self.plugin
+                    ) for item in results[:8]
                 )
                 values.append((
                     "EGT", row.get("analyys_kood"), _egt_depth_text(row),
                     _date_value(row.get("kuupaev")),
-                    row.get("analyys_meetod"), row.get("labor"), indicators,
+                    self.plugin.decode_egt(
+                        3, "analyys_meetod", row.get("analyys_meetod")
+                    ),
+                    self.plugin.decode_egt(3, "labor", row.get("labor")),
+                    indicators,
                 ))
         sarv_rows = sum(self._sarv_analyses_by_source.values(), [])
         if self.analysis_sources["SARV"].isChecked():
@@ -1574,16 +3732,142 @@ class DetailWidget(QWidget):
                 ))
         self._fill_rows(self.analyses, values)
         self.tabs.setTabText(
-            4, f"{self.plugin.t('Analüüsid')} ({len(egt_rows) + len(sarv_rows)})"
+            4,
+            f"{self.plugin.t('Analüüsid')} "
+            f"({len(egt_rows) + len(sarv_rows)})",
         )
+
+    def refresh_decoded_values(self):
+        """Refresh already-open tables after asynchronous domains arrive."""
+        self._refresh_samples()
+        self._refresh_analyses()
 
     def set_sarv_specimens(self, rows):
         self._sarv_specimens = list(rows)
+        self.refresh_profile_filters()
+        self._refresh_specimens()
+        self._notify_cross_section_update()
+
+    @staticmethod
+    def _profile_filter_values(value):
+        values = set()
+        if isinstance(value, dict):
+            for key in (
+                "id", "code", "value", "value_en", "name", "name_en",
+                "type",
+            ):
+                if value.get(key) not in (None, ""):
+                    values.add(str(value[key]))
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                values.update(DetailWidget._profile_filter_values(item))
+        elif value not in (None, ""):
+            values.add(str(value))
+        return values
+
+    @classmethod
+    def _profile_value_matches(cls, value, selected):
+        return not selected or bool(
+            cls._profile_filter_values(value).intersection(selected)
+        )
+
+    def refresh_profile_filters(self, checked=None):
+        """Apply active EGT/SARV type filters only to profile markers."""
+        apply_filters = bool(
+            self.profile_apply_filters.isChecked() and self.plugin.dock
+        )
+        egt_samples = list(self._egt_samples)
+        egt_analyses, results_by_analysis = self._egt_analyses
+        egt_analyses = list(egt_analyses)
+        sarv_samples = list(self._sarv_samples)
+        sarv_analyses = sum(self._sarv_analyses_by_source.values(), [])
+        sarv_specimens = list(self._sarv_specimens)
+
+        if apply_filters:
+            egt_requirements = (
+                self.plugin.dock.filters.egt_domain_requirements()
+            )
+            sample_requirements = egt_requirements["samples"]
+            egt_samples = [
+                row for row in egt_samples
+                if self.plugin._row_matches_domains(
+                    row, sample_requirements
+                )
+            ]
+
+            analysis_requirements = egt_requirements["analyses"]
+            direct_requirements = {
+                field: selected
+                for (table_id, field), selected
+                in analysis_requirements.items()
+                if table_id == 3
+            }
+            result_requirements = {
+                field: selected
+                for (table_id, field), selected
+                in analysis_requirements.items()
+                if table_id == 4
+            }
+            filtered_analyses = []
+            for row in egt_analyses:
+                if not self.plugin._row_matches_domains(
+                    row, direct_requirements
+                ):
+                    continue
+                if any(result_requirements.values()):
+                    results = results_by_analysis.get(
+                        row.get("globalid"), []
+                    )
+                    if not any(
+                        self.plugin._row_matches_domains(
+                            result, result_requirements
+                        )
+                        for result in results
+                    ):
+                        continue
+                filtered_analyses.append(row)
+            egt_analyses = filtered_analyses
+
+            sarv_requirements = self.plugin.dock.sarv_filters.requirements()
+            sarv_samples = [
+                row for row in sarv_samples
+                if self._profile_value_matches(
+                    row.get("purpose"),
+                    sarv_requirements["sample_purpose"],
+                )
+                and self._profile_value_matches(
+                    row.get("type"), sarv_requirements["sample_type"],
+                )
+            ]
+            sarv_analyses = [
+                row for row in sarv_analyses
+                if self._profile_value_matches(
+                    row.get("analysis_method"),
+                    sarv_requirements["analysis_method"],
+                )
+            ]
+            sarv_specimens = [
+                row for row in sarv_specimens
+                if self._profile_value_matches(
+                    row.get("type"),
+                    sarv_requirements["specimen_type"],
+                )
+            ]
+
+        self.profile.set_samples(egt_samples)
+        self.profile.set_analyses(egt_analyses)
+        self.profile.set_sarv_samples([
+            track for row in sarv_samples
+            if (track := _sarv_track(row, "sample")) is not None
+        ])
+        self.profile.set_sarv_analyses([
+            track for row in sarv_analyses
+            if (track := _sarv_analysis_track(row)) is not None
+        ])
         self.profile.set_sarv_specimens([
-            track for row in rows
+            track for row in sarv_specimens
             if (track := _sarv_track(row, "specimen")) is not None
         ])
-        self._refresh_specimens()
 
     def _refresh_specimens(self):
         values = []
@@ -1605,7 +3889,8 @@ class DetailWidget(QWidget):
             ]
         self._fill_rows(self.specimens, values)
         self.tabs.setTabText(
-            5, f"{self.plugin.t('Eksemplarid')} ({len(self._sarv_specimens)})"
+            5,
+            f"{self.plugin.t('Eksemplarid')} ({len(self._sarv_specimens)})",
         )
 
     def set_attachments(self, rows):
@@ -1654,7 +3939,11 @@ class DetailWidget(QWidget):
             QDesktopServices.openUrl(QUrl(item.text()))
 
     def _fill_pairs(self, table, attributes, role):
-        rows = [(key, value) for key, value in attributes.items() if value not in (None, "")]
+        rows = [
+            (key, value) for key, value in attributes.items()
+            if value not in (None, "")
+            and not str(key).startswith(("_qeoloog_", "vk_"))
+        ]
         # Dropping all rows also removes cell widgets left by the previous object.
         table.setRowCount(0)
         table.setRowCount(len(rows))
@@ -1669,10 +3958,22 @@ class DetailWidget(QWidget):
             url = ""
             if key_lower == "gea_id":
                 url = f"https://gis.egt.ee/auk/{object_path}/{display}/vaade"
+            elif key_lower == "kkr_kood" and role == "veka_boreholes":
+                url = f"https://veka.eelis.ee/puurauk/{display}"
             elif key_lower == "kande_alus_nr":
                 url = f"https://fond.egt.ee/fond/egf/{display}"
             elif key_lower == "sarv_id":
-                url = f"https://geoloogia.info/locality/{display}"
+                sarv_path = (
+                    "site" if role == "sarv_sites"
+                    else "locality" if role == "sarv_localities"
+                    else "drillcore"
+                )
+                try:
+                    valid_sarv_id = int(str(display)) > 0
+                except (TypeError, ValueError):
+                    valid_sarv_id = False
+                if valid_sarv_id:
+                    url = f"https://geoloogia.info/{sarv_path}/{display}"
             if url:
                 self._set_link_widget(table, row_index, 1, display, url)
             else:
@@ -1691,13 +3992,39 @@ class DetailWidget(QWidget):
         table.setCellWidget(row, column, link)
 
     @staticmethod
-    def _fill_rows(table, rows):
+    def _begin_table_update(table):
+        header = table.horizontalHeader()
+        state = (
+            table.isSortingEnabled(),
+            header.sortIndicatorSection(),
+            header.sortIndicatorOrder(),
+        )
+        if state[0]:
+            table.setSortingEnabled(False)
+        return state
+
+    @staticmethod
+    def _restore_table_sorting(table, state):
+        enabled, section, order = state
+        if not enabled:
+            return
+        table.setSortingEnabled(True)
+        if 0 <= section < table.columnCount():
+            table.sortItems(section, order)
+
+    @classmethod
+    def _fill_rows(cls, table, rows, restore_sorting=True):
+        sorting_state = cls._begin_table_update(table)
         table.clearContents()
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for column, value in enumerate(row):
                 if isinstance(value, dict) and value.get("url"):
-                    text = html_escape(_display_value(value.get("text")))
+                    raw_text = value.get("text")
+                    table.setItem(
+                        row_index, column, SortableTableItem(raw_text)
+                    )
+                    text = html_escape(_display_value(raw_text))
                     url = html_escape(str(value["url"]))
                     link = QLabel(f'<a href="{url}">{text}</a>')
                     link.setOpenExternalLinks(True)
@@ -1706,8 +4033,13 @@ class DetailWidget(QWidget):
                     link.setToolTip(str(value["url"]))
                     table.setCellWidget(row_index, column, link)
                 else:
-                    table.setItem(row_index, column, QTableWidgetItem(_display_value(value)))
+                    table.setItem(
+                        row_index, column, SortableTableItem(value)
+                    )
+        if restore_sorting:
+            cls._restore_table_sorting(table, sorting_state)
         table.resizeColumnsToContents()
+        return sorting_state
 
 
 class QeoloogDock(QDockWidget):
@@ -1717,16 +4049,55 @@ class QeoloogDock(QDockWidget):
         self.tabs = QTabWidget()
         self.layers = LayerConfigWidget(plugin)
         self.filters = FilterWidget(plugin)
+        self.sarv_filters = SarvFilterWidget(plugin)
+        self.veka = VekaWidget(plugin)
+        self.search = SearchWidget(plugin)
+        self.export = ExportWidget(plugin)
+        self.cross_section_window = CrossSectionWindow(plugin, parent)
+        self.cross_sections = self.cross_section_window.content
+        self.cross_section_launcher = CrossSectionLauncher(
+            plugin, self.cross_section_window
+        )
         self.details = DetailWidget(plugin)
         self.tabs.addTab(self.layers, plugin.t("Kihid"))
-        self.tabs.addTab(self.filters, plugin.t("EGT filtrid"))
+        self.filter_page = self._scroll(self.filters)
+        self.sarv_filter_page = self._scroll(self.sarv_filters)
+        self.search_page = self._scroll(self.search)
+        self.tabs.addTab(self.filter_page, plugin.t("EGT filtrid"))
+        self.tabs.addTab(self.sarv_filter_page, plugin.t("SARV filtrid"))
+        self.veka_page = self._scroll(self.veka)
+        self.tabs.addTab(self.veka_page, plugin.t("VEKA"))
+        self.tabs.addTab(self.search_page, plugin.t("Otsing"))
+        self.export_page = self._scroll(self.export)
+        self.tabs.addTab(self.export_page, plugin.t("Ekspordi"))
+        self.tabs.addTab(
+            self.cross_section_launcher, plugin.t("Läbilõiked")
+        )
         self.tabs.addTab(self.details, plugin.t("Objekti andmed"))
         self.setWidget(self.tabs)
+
+    @staticmethod
+    def _scroll(widget):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
+        return scroll
 
     def show_details(self):
         self.tabs.setCurrentWidget(self.details)
         self.show()
         self.raise_()
+
+    def show_cross_sections(self):
+        self.cross_section_window.show()
+        self.cross_section_window.raise_()
+        self.cross_section_window.activateWindow()
+
+    def close_cross_sections(self):
+        if self.cross_section_window:
+            self.cross_section_window.hide()
+            self.cross_section_window.deleteLater()
+            self.cross_section_window = None
 
 
 def _number(value):
@@ -1870,11 +4241,26 @@ def _display_value(value):
     return str(value)
 
 
-def _analysis_result(item, fallback="Näitaja"):
+def _analysis_result(item, fallback="Näitaja", plugin=None):
     indicator = item.get("analyys_naitaja") or fallback
     value = item.get("tulem")
     unit = item.get("yhik") or ""
-    return f"{indicator}: {_display_value(value)} {unit}".strip()
+    prefix = item.get("erimark") or ""
+    if plugin:
+        indicator = plugin.decode_egt(4, "analyys_naitaja", indicator)
+        unit = plugin.decode_egt(4, "yhik", unit)
+        prefix = plugin.decode_egt(4, "erimark", prefix)
+    result_type = item.get("analyys_tulem_tyyp")
+    type_text = (
+        plugin.decode_egt(4, "analyys_tulem_tyyp", result_type)
+        if plugin and result_type not in (None, "") else ""
+    )
+    measured = " ".join(
+        part for part in (str(prefix).strip(), _display_value(value), str(unit).strip())
+        if part
+    )
+    label = f"{indicator}: {measured}".strip()
+    return f"{label} ({type_text})" if type_text else label
 
 
 def _nice_depth_step(max_depth, draw_height):
