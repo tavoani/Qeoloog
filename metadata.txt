@@ -1,19 +1,118 @@
 [general]
 name=Qeoloog
-description=EGT GEA ja SARV geoloogiaandmete kuvamise ja uurimise rakendus koos MaRu WMS/WFS teenuste toega.
-about=Qeoloog kuvab ja seob eelkõige EGT GEA ning SARV andmebaaside geoloogiaandmeid: puuraukude ja vaatluspunktide üldandmeid, läbilõikeid, puursüdamikke ja nende pilte, proove, analüüse, eksemplare, manuseid ning kirjandust. Lisaks saab avada ja seadistada Maa- ja Ruumiameti (MaRu) ning teiste avalike andmeallikate WMS/WFS teenuseid.
-version=3.4.3
+description=EGT GEA, SARV, MaRu, VEKA, GTK ja Läti LVĢMC geoloogiaandmete uurimise, kirjutuskaitstud Portali vaatamise, koondläbilõigete ning Leapfrog-ekspordi rakendus.
+about=Qeoloog kuvab ja seob EGT GEA, SARV ja Maa- ja Ruumiameti ajaloolise puursüdamike andmekogu geoloogiaandmeid, EELIS/VEKA puurkaeve ning EGT maavarade registri ruumiandmeid. EGT ma_orig_id seotakse ametliku MaRu puursüdamiku kirjega ka otse avaliku WFS-i kaudu; ühendvaates kuvatakse MaRu üldandmed, geoloogiline kirjeldus, kastid, kastipildid, proovid, proovipildid ja nende metaandmed. Seoseid saab kohalikult parandada ja koondatult eksportida ilma lähteandmebaase muutmata. Ühine Otsing ja filtrid paan hõlmab EGT, SARV ja MaRu objekte; VEKA jääb eraldi paani. Kihid paanis saab kihikataloogi filtreerida koodi, nime, teenuse, rühma ja oleku järgi. LK menüü avalikud GTK ja Läti LVĢMC/GeoLatvija kihid lisavad Soome ning Läti aluspõhja, pinnakatte, puuraukude, karsti, rikete, seismika, põhjavee ja maavarade vaated; i-nupp avab nende saadaolevad atribuudid ning Läti puuraugud on otsitavad. Rakendus näitab puuraukude, vaatluspunktide ja puurkaevude üldandmeid, läbilõikeid, puursüdamikke ja nende pilte, proove, analüüse, eksemplare, allika järgi rühmitatavaid manuseid ning kirjandust. QGIS-i autentimishoidla kaudu saab sisse logida EGT ArcGIS Portalisse ja avada kasutajale nähtavaid FeatureServeri kihte kirjutuskaitstult; Qeoloog ei loo, muuda ega kustuta Portali andmeid. Maardlate, aktiivsete mäeeraldiste ja aktiivsete uuringualade WFS-kihid rühmitatakse QGIS-i legendis maavara liigi järgi. Kohalikke puursüdamiku kastiparandusi saab JSON- või CSV-failina eksportida. Mitme objekti koondläbilõige paigutab tulbad absoluutkõrguse ja kauguse järgi, kuvab DEM-profiili ning ekspordib SVG- või PDF-faili. EGT, SARV ja VEKA objektid saab eksportida Leapfrogile sobivate Collar, Survey ja Interval CSV-tabelitena. Lisaks saab avada ja seadistada MaRu ning teiste avalike andmeallikate WMS/WFS/ArcGIS teenuseid.
+version=3.49.6
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
 author=Tavoani
 email=tavo.ani@icloud.com
 category=Web
-tags=Estonia,EGT,GEA,SARV,MaRu,WMS,WFS,Maa- ja Ruumiamet,geology,borehole,core,basemap
+tags=Estonia,Finland,Latvia,EGT,GTK,LVGMC,GeoLatvia,GEA,SARV,EELIS,VEKA,MaRu,WMS,WFS,ArcGIS,MapServer,Portal,FeatureServer,OAuth2,read-only,DEM,Leapfrog,CSV,export,corrections,cross-section,geology,borehole,water well,hydrogeology,basemap
 experimental=False
 deprecated=False
 server=False
 hasProcessingProvider=False
-changelog=3.4.3 - Added repository-ready licensing, PNG icon and bilingual documentation.
+changelog=3.49.6 - Bundles the updated Annex 5 Excel example and adds an offline save button next to measurement import.
+    3.49.5 - Adds depth-interval import for the four Annex 5 basement migmatization grades. Displays distinct hatching in the rock column and a matching legend in PDF and SVG.
+    3.49.4 - Adds CSV, TSV and XLSX measurement import for Annex 5 basement logs: probe and sample density, magnetic susceptibility, and structural angles with optional azimuth. Measurements can be saved with the local object.
+    3.49.3 - Reviews local ETL export selections before creating workbooks, blocking overlapping or invalid geological intervals and incomplete compound units. Adds long, 285 mm wide lithology log layouts based on the supplied Annex 5 cover and basement examples.
+    3.49.2 - Applies archived Faktika rules offline in the local ETL10 geology editor: cover-only genesis, bedrock-only lithology qualification, index-specific members, and separate compound upper and lower indices and members.
+    3.49.1 - Makes the local object editor a movable, non-modal window, adds offline ETL6/7/8/10 coded-value selectors with subtype-aware options, and protects open drafts against overwriting newer local changes.
+    3.49.0 - Adds printable lithology logs with depth-scaled vector PDF/SVG, optional gamma CSV and sample/analysis tracks, and local ETL7/8 sample series, measurements, references and results.
+    3.48.0 - Adds selectable detail columns and a local GeoPackage object editor with public EGT/SARV/VEKA copies, independent original comparison, and staged ETL6/10 Excel import and export.
+    3.47.1 - Adds independent depth labels for EGT boreholes and observation points, with configurable name, depth and identifier labels for VEKA and SARV.
+    3.47.0 - Adds mouse editing for local outcrop drawings: points, notes and attachments, obscured intervals, rockfall debris and measured or schematic wall profiles. Biozone finds are point observations with stable correlation IDs; interpreted ranges remain an optional separate track.
+    3.46.0 - Adds a portable GeoPackage workspace for named cross-sections, local borehole/outcrop logs, EGT/SARV/VEKA links, manual correlations, optional StrataPy-inspired style, editable isotope and interval tracks, and verified backups with attachments.
+    3.45.3 - Adds an optional EGT borehole depth row to map labels, from the point's recorded length or vertical extent, without additional service requests.
+    3.45.2 - Repairs combined-section horizontal zoom: supports pixel-only touchpad and native horizontal wheel events, routes viewport gestures to the drawing, lets manual scale override automatic spacing and persists that choice; zooming out also shrinks the scrollable canvas.
+    3.45.1 - Repairs the three Latvian geology WFS connections using the official LVGMC geology workspace, migrates saved settings/project sources, and hardens archive-area filtering against changed services, ambiguous report IDs and late responses after project changes. Supports explicitly declared response CRS and bounds the geometry cache.
+    3.45.0 - Adds per-report archive-area on/off controls beside kande_alus_nr, an independent polygon-based public EGT borehole filter/reset, preserved existing filters, complete multipart area loading and project-local filter restoration. No other QA findings were changed.
+    3.44.2 - Fixes project cross-section restoration, dense section export layout, explicit DEM NoData gaps, conflicting source SARV IDs, complete SARV/WFS/AUQ pagination, detail image links, numeric ID formatting, filter-aware identify, stale MaRu matches, empty profile tracks, detail refresh lifetime, range-index colours, bounded record selection, and selection/export of viewed legacy VEKA chemistry.
+    3.44.1 - Adds a Go to location button beside Detailed view in Object data, centring the map on the current object while preserving scale; sets EGT as the initial and reset search source.
+    3.44.0 - Adds an Additional layers / Geology / Latvia catalogue of official public LVĢMC and GeoLatvija bedrock, Quaternary, borehole, karst, fault, seismic-profile, groundwater-body, mineral-deposit, extraction-licence and extraction-limit layers; adds read-only ArcGIS MapServer support, Latvia borehole search, nested catalog groups and i-tool details for Latvian WFS/REST/WMS features.
+    3.43.0 - Extends the map information tool to public GTK WFS objects and queryable GTK WMS maps, showing returned attributes in Qeoloog's copyable detail view; moves the combined cross-section object list below the drawing, orders it by displayed chainage and makes it collapsible with its state saved in the QGIS project.
+    3.42.1 - Keeps GTK WMS map overlays transparent while forcing their server legend graphics onto a white background, making official GTK legends readable in QGIS dark themes and automatically migrating already loaded GTK layers.
+    3.42.0 - Adds a nested Additional layers / Geology / GTK menu with official public Geological Survey of Finland WMS/WFS layers for bedrock, superficial deposits, geophysics, observations, drillings, drill cores, mineral occurrences and ground investigations, using each service's native EPSG:3067 request CRS.
+    3.41.1 - Prioritizes exact MaRu collar identifiers in broad searches, distinguishes confirmed and possible EGT matches, renders EGT/SARV/MaRu core-box extents in adjacent K/S/M lanes over the lithology column, fixes source-aware missing-box hatching, and immediately synchronizes core-box/sample source changes with combined cross-sections.
+    3.41.0 - Interweaves EGT, SARV and MaRu drill-core records with conservative number/name/location matching, keeps EGT as the primary profile while optional MaRu intervals fill only uncovered gaps, adds independent EGT/MaRu profile, core-box and sample switches, categorizes MaRu points as cover/bedrock/basement, and makes sample location references searchable and clickable.
+    3.40.0 - Unifies EGT, SARV and MaRu search/filter views, adds detailed MaRu identifiers, provenance and sample-processing filters, makes MaRu sample photos clickable in profiles, groups attachment metadata by source without duplicating MaRu box photos by default, resolves MaRu-to-EGT links directly from public WFS, and adds selected search results to combined cross-sections.
+    3.39.1 - Retains MaRu's negative-D terminal intervals with their absolute thickness and an unpenetrated + marker, keeps child-table geology/core/sample text matches in search results, prevents inverted invalid core boxes, and disables filters that do not apply to the selected MaRu or VEKA source.
+    3.39.0 - Adds the official MaRu historical drill-core database as a searchable map layer and local SQLite index, links EGT ma_orig_id records to MaRu general data, geological logs, core boxes, images and samples, supports validated local relinking and combined SARV/MaRu link export, includes MaRu in search and cross-sections, and adds a filterable layer catalogue.
+    3.38.0 - Adds a large read-only object detail window with populated general fields, non-empty related-data tables, decoded and original values, technical field names, search, link opening and TSV clipboard copying.
+    3.37.0 - Makes all Qeoloog-managed ArcGIS Portal layers read-only, removes Portal editing, object-creation and fieldwork-upload controls, and hard-blocks every Portal write path while preserving sign-in, catalog, viewing, labels, details and cross-sections.
+    3.36.9 - Resolves the Faktika test service's deployment-specific layer and table IDs dynamically from authenticated REST metadata instead of assuming the production service numbering.
+    3.36.8 - Adds detailed Faktika layer-load diagnostics, including QGIS provider errors and sanitized ArcGIS REST authentication, permission, and schema results when HTTP 200 hides a JSON error.
+    3.36.7 - Adds an opt-in Faktika test-server workspace under advanced Portal settings, safely routes new objects to the active or explicitly selected Faktika environment, and documents server-managed editor tracking for creator/editor audit fields.
+    3.36.6 - Refreshes drill-core status choices from live ArcGIS REST domains, decodes status labels, validates box-depth overlaps with an edit-or-cancel resolution flow, and maps combined-section Ctrl/Command-wheel and Shift-wheel to persisted vertical and horizontal scales.
+    3.36.5 - Prevents closed selectors on the filter, VEKA, search and export pages from changing under the mouse wheel, and hides empty EGT/SARV related-data switches from the profile header.
+    3.36.4 - Keeps the Geophysical fieldwork Portal layer legend categorized by the Method field after loading, project restore, editing and CSV upload.
+    3.36.3 - Moves Faktika Notes and Additional information to the right-hand details form and replaces their single-line inputs with roomier multiline editors.
+    3.36.2 - Compacts the Faktika SARV match and compound-unit controls, collapses the Portal elevation check by default, limits depth/method/underwater-depth fields to offshore observations, and keeps Unknown/Not applicable formation labels visible after index filtering.
+    3.36.1 - Improves Faktika editing with a readable date-time control, inherited author/source/unit values, compound-unit upper/lower index and formation controls, authoritative Unknown/Not applicable labels, invalid-zero cleanup, and enforced cover-bedrock-basement depth order.
+    3.36.0 - Adds a signed-in Portal elevation/location check with file-based DEM matching, map-picked candidate XY positions, robust 3x3 sampling, temporary tolerance-band rendering below the object layer, and official coordinate-dependent BK77/EH2000/EUREF-EST97 height conversion without overwriting Z.
+    3.35.0 - Shows authenticated field-mapping image attachments, applies shared EGT label rules to Portal Faktika workspaces with visible-extent batching, includes field-mapping points in cross-sections, offers saved or plausible SARV matches in the borehole editor, and treats bedrock shallower than 1 m as the 0.5 m label unit.
+    3.34.1 - Makes authenticated EGT field-mapping points selectable with Qeoloog's map tool, decodes their Portal subtype/domain labels and loads related geological descriptions into the profile.
+    3.34.0 - Adds integrated EGT cleanup and field-mapping Portal bundles, index-specific formation choices, unit-type-aware genesis and lithology-supplement fields, derived borehole length, wheel-safe coordinate/domain editors, and removes person-directory maintenance from the object editor.
+    3.33.0 - Adds map-click placement for new Faktika PointZ objects, automatic parent unit-category labels with basement-first priority, human-readable classifier labels in object details, and local add/edit support for drill-core boxes, depth extents and descriptions.
+    3.32.0 - Adds the signed-in-only Faktika workspace with grouped internal points and related tables, public/internal record matching, validated PointZ and geological-interval editing, attachment/access/person maintenance, optimistic concurrency checks and atomic service-wide Portal saves.
+    3.31.0 - Adds a signed-in-only geophysical fieldwork CSV importer backed by the live Portal domains, creates one Z-enabled multipart line split at gaps over 50 m, and prevents automatic OAuth prompts during QGIS startup.
+    3.30.1 - Applies each EGT Portal FeatureServer layer's authoritative ArcGIS drawingInfo renderer so standard geological colours, line patterns, category labels and picture markers are retained in the QGIS legend.
+    3.30.0 - Adds an automatic signed-in EGT Portal catalog in a new EGT toolbar menu beside LK, grouped by access and ArcGIS service folder with lazy loading of each service's layers.
+    3.29.1 - Adds a one-button EGT Portal sign-in flow which creates the full QGIS OAuth2 configuration after asking only for the two values from the internal guide, while keeping advanced authentication settings optional.
+    3.29.0 - Adds QGIS-authentication-backed EGT ArcGIS Portal FeatureServer layers, authenticated layer discovery and native permission-aware Portal editing without storing credentials in Qeoloog.
+    3.28.2 - Corrects the bedrock-surface elevation label abbreviation to APR.
+    3.28.1 - Uses compact EGT map-label prefixes: unprefixed alias, PP for cover thickness, APR for bedrock-surface elevation and AP for the first bedrock index.
+    3.28.0 - Adds persistent multi-select EGT map-label content settings for PA and VP: name, alias, cover thickness, bedrock-surface elevation, 0.5 m index/lithology and first bedrock index. Derived values load asynchronously for the visible extent.
+    3.27.5 - Replaces the adaptive KV coordinate grid with fixed 1:50,000 map sheets; migrates saved built-in settings and loaded Qeoloog grid layers.
+    3.27.4 - Adds a separate utility infrastructure restriction-zone WMS layer combining telecommunications, electricity, gas, district heating and water supply under Additional layers / Helpers.
+    3.27.3 - Adds EGT 1:200,000 bedrock and Quaternary WMS maps to the Geology layer menu.
+    3.27.2 - Drawing a cross-section line now automatically adds visible EGT, VEKA and SARV drill-core points within a 100 m corridor, fills EGT/VEKA intervals asynchronously and avoids duplicate objects.
+    3.27.1 - Automatically enables point snapping when drawing cross-section lines and rebuilds stale snapping indexes after filter, visibility or data changes; restores prior snapping settings when drawing ends.
+    3.27.0 - Adds a multi-select VEKA use-value filter based on the EELIS `kasutus` code and its description.
+    3.26.1 - Keeps EGT borehole and observation-point WFS layers alive while promoting them to the top of the layer tree; cross-section line vertices snap to visible section points within 12 screen pixels.
+    3.26.0 - Snaps cross-section line vertices to visible EGT, SARV and VEKA section-point locations within 12 screen pixels and previews the match with a marker.
+    3.25.2 - Makes the complete Layers page vertically scrollable so its settings and catalog fit within shorter QGIS windows.
+    3.25.1 - Adds a persistent Layers-panel setting for the shared EGT, SARV and VEKA point-label text size and applies changes immediately to loaded layers.
+    3.25.0 - Adds genesis beside observation-point profile indices, default genesis/lithology map labels at 0.5 m, and hides SARV sample, analysis and specimen tracks for observation points.
+    3.24.1 - Fixes Geological Archive ID search, makes registry queries lightweight and independent of saved layer settings, and renders active exploration areas as resource-coloured outlines without fill.
+    3.24.0 - Adds direct Mineral Resources Register and Geological Archive searches, opens one selected archive survey area as an outline-only filtered WFS layer, and adds the official L-EST97 coordinate grid.
+    3.23.2 - Shows one index-free combined thickness for all selected stratigraphic units and prevents parent/child selections from double-counting an interval.
+    3.23.1 - Adds click-to-open report metadata and Geological Archive links for engineering-geology survey points.
+    3.23.0 - Adds mineral-resource legends and click-to-open register details for deposits, active mining claims and active exploration areas.
+    3.22.1 - Adds a trailing plus to an index-thickness label when the matching unit reaches the bottom of the borehole.
+    3.22.0 - Adds optional map labels with summed EGT index thicknesses while keeping compound-unit interval totals separate in parentheses.
+    3.21.2 - Prepares a clean QGIS Plugins Repository release and documents the VEKA well-passport field as a Bandit false positive.
+    3.21.1 - Applies large EGT search-result filters locally to prevent oversized WFS requests while preserving OR matching for multiple stratigraphic indices.
+    3.20.2 - Reads EGT ground elevation from PointZ WFS geometry, displays it in object details and carries it into combined cross-sections.
+    3.20.1 - Fixes cross-section line and drawing-preview visibility on the QGIS 4 map canvas.
+    3.20.0 - Adds polygon-based EGT/SARV/VEKA export to Leapfrog Collar, Survey and Interval CSV files, including optional VEKA groundwater fields and selected water-analysis results.
+    3.19.1 - Moves the combined cross-section into a separate resizable window and keeps only a compact open/hide launcher in the main dock.
+    3.19.0 - Adds persisted multi-well cross-sections with map-line, distance/elevation positioning, layer toggles, local DEM comparison, and SVG/PDF export with an optional overview map.
+    3.18.1 - Fixes Windows sorting for out-of-range VEKA dates and preserves the selected VEKA detail tab when opening another well.
+    3.18.0 - Adds an apply/reset search-result filter and draws the latest static water level on VEKA well profiles.
+    3.17.0 - Combines modern KOTKAS and legacy VEKA water analyses, links available original protocols, and adds driller information to VEKA details.
+    3.16.0 - Draws scaled VEKA well construction with an on-profile legend and restores water-chemistry loading through normalized cadastral and PRK identifiers.
+    3.15.0 - Adds a dedicated VEKA detail view with construction, pumping-test and water-chemistry tabs, and sortable related-data tables.
+    3.14.1 - Clarifies discharge and specific-capacity filters and safely unifies convertible VEKA water-quality units and known duplicate indicator codes.
+    3.14.0 - Adds EELIS/VEKA water wells, hydrogeological and water-quality filters, shared search and a graduated colour/size symbology designer.
+    3.13.0 - Applies active EGT/SARV type filters to profile markers on demand and adds complete EGT stratigraphic-index and partial Contains filters.
+    3.12.0 - Adds subtle lithological boundary guide lines and compacts the profile automatically when P, A, SP, SA or SE tracks are hidden.
+    3.11.0 - Adds persisted invalid GEA sarv_id and Land Board ID markers, bidirectional local EGT-SARV links, and automatic combined EGT sample/analysis display from linked SARV objects.
+    3.10.0 - Removes the personal-data workspace, returns SARV-link export to Layers, adds compound-aware EGT stratigraphic-index search, and adds a persisted WFS/API preference for EGT detail loading.
+    3.8.1 - The local SARV link manager can now link an EGT object to a SARV drill core, locality or research site.
+    3.8.0 - Adds validated local EGT-SARV drill-core link corrections, immediate combined-data refresh, reset to the GEA link, and consolidated CSV/JSON export.
+    3.7.4 - Treats every GEA sarv_id as a SARV drill-core ID, avoids cross-type ID collisions, and opens confirmed SARV links inside Qeoloog.
+    3.7.3 - Replaced unsafe ElementTree capabilities parsing with bounded Qt streaming XML parsing that rejects DTDs and custom entities.
+    3.7.2 - Search results keep the map scale, rank exact identifiers and names first, and include inherited SARV drill-core numbers.
+    3.7.1 - Restores Qeoloog roles, category symbols and borehole labels for untagged WFS layers in older projects.
+    3.7.0 - Added official EGT code decoding, multi-select EGT/SARV filters and shared search.
+    3.6.1 - Added SARV drill cores to SK locations using their linked locality coordinates.
+    3.6.0 - Added SK SARV locality/research-site layers, point details and conservative persisted EGT-SARV matching.
+    3.5.2 - Reordered geological-log columns to depth, index, EGT/SARV markers and lithology.
+    3.5.1 - Geological logs now load from WFS first, with the GEA API as a fallback.
+    3.5.0 - Added boundary-depth labels, WFS Z detection, highlighted PA button, AK extent workaround and topmost PA/VP ordering.
+    3.4.3 - Added repository-ready licensing, PNG icon and bilingual documentation.
     3.4.2 - Fixed SARV drill-core image links.
 tracker=https://github.com/tavoani/Qeoloog/issues
 repository=https://github.com/tavoani/Qeoloog
